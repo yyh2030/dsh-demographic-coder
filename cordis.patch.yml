@@ -1,0 +1,4 @@
+- insert:
+    - id: demographic-coder
+      name: '@local/demographic-coder'
+      config: {}

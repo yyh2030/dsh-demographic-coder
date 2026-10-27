@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Demographics Entry",
+    "description": "Import Excel / Word questionnaires, auto-detect categorical variables, key in paper questionnaires, and export coded CSV."
+  }
+}
