@@ -7,8 +7,8 @@
  * export a coded CSV plus its codebook and a JSON snapshot into the folder
  * the user picks.
  *
- * Parsing happens in the page (zip + XML, no dependency), the only Host work
- * is writing the export, so nothing leaves the machine.
+ * Parsing happens in the page (zip + XML, no dependency). The local Host
+ * owns revisioned storage and writes explicit exports.
  */
 window.__ModuleLoader__.load({
   id: '@local/demographic-coder',
@@ -18,7 +18,6 @@ window.__ModuleLoader__.load({
     const { useState, useEffect, useMemo, useRef, useCallback, useSyncExternalStore } = React
 
     const API = '/api/demographic-coder'
-    const LS_DATA = 'dc:dataset:v1'
     const LS_DIR = 'dc:dir:v1'
     const LS_TAB = 'dc:tab:v1'
 
@@ -287,12 +286,6 @@ window.__ModuleLoader__.load({
 
     const TEMPLATES = [
       {
-        id: 'study',
-        label: '本实验基本信息表',
-        vars: ['sex', 'handedness', 'age', 'birthDate', 'eduYears', 'eduLevel', 'grade',
-               'ethnicity', 'birthPlace', 'currentResidence', 'marital', 'fillDate']
-      },
-      {
         id: 'core',
         label: '基础人口学',
         vars: ['sex', 'age', 'education', 'marital', 'hukou', 'political', 'ethnicity', 'onlyChild']
@@ -345,11 +338,13 @@ window.__ModuleLoader__.load({
       for (const opt of entry.options) {
         for (const label of opt.labels) if (normKey(label) === value) return opt.code
       }
-      for (const opt of entry.options) {
-        const labels = opt.labels.map(label => normKey(label)).sort((a, b) => b.length - a.length)
-        for (const label of labels) if (label.length >= 1 && value.includes(label)) return opt.code
-      }
       return null
+    }
+
+    function suggestDictValue(entry, raw) {
+      if (!entry || matchDictValue(entry, raw) != null) return []
+      const value = normKey(raw)
+      return entry.options.filter(option => option.labels.some(label => normKey(label).length > 1 && value.includes(normKey(label))))
     }
 
     function uniqueOf(values) {
@@ -366,7 +361,9 @@ window.__ModuleLoader__.load({
 
     function codeOf(column, raw) {
       const value = normText(raw)
-      if (!value) return ''
+      if (!value) return column?.coding?.missing == null ? '' : String(column.coding.missing)
+      const ignored = new Set((column?.coding?.ignored || []).map(item => typeof item === 'string' ? item : item?.value).filter(Boolean))
+      if (ignored.has(value)) return value
       if (column && column.coding && column.coding.enabled) {
         const map = column.coding.map || {}
         if (map[value] !== undefined && map[value] !== '') return String(map[value])
@@ -382,10 +379,12 @@ window.__ModuleLoader__.load({
     function effectiveOptions(column) {
       const out = new Map()
       const dict = column && column.dict ? CODING_BY_ID[column.dict] : null
-      if (dict) for (const opt of dict.options) out.set(opt.label, opt.code)
+      const ignored = new Set((column?.coding?.ignored || []).map(item => typeof item === 'string' ? item : item?.value).filter(Boolean))
+      if (dict) for (const opt of dict.options) { if (!ignored.has(opt.label) && !ignored.has(String(opt.code))) out.set(opt.label, opt.code) }
       const map = (column && column.coding && column.coding.map) || {}
       for (const [key, code] of Object.entries(map)) {
-        if (/^-?\d+(\.\d+)?$/.test(key)) continue
+        if (ignored.has(key)) continue
+        if (dict && dict.options.some(option => option.code === key && String(code) === key)) continue
         out.set(key, code)
       }
       return [...out.entries()].map(([label, code]) => ({ label, code }))
@@ -730,6 +729,17 @@ window.__ModuleLoader__.load({
         }
       }
       if (!sheets.length) throw new Error('Excel 文件里没有工作表')
+      const styleXml = await zip.text('xl/styles.xml')
+      const zeroWidths = []
+      if (styleXml) {
+        const styles = parseXml(styleXml)
+        const formats = new Map(descendants(styles, 'numFmt').map(node => [attr(node, 'numFmtId'), attr(node, 'formatCode')]))
+        const xfs = descendants(styles, 'cellXfs')[0]
+        if (xfs) for (const xf of kids(xfs, 'xf')) {
+          const format = formats.get(attr(xf, 'numFmtId')) || ''
+          zeroWidths.push(/^0+$/.test(format) ? format.length : 0)
+        }
+      }
       const out = []
       for (const sheet of sheets) {
         const xml = await zip.text(sheet.path)
@@ -765,6 +775,8 @@ window.__ModuleLoader__.load({
               const v = firstKid(cell, 'v')
               value = v ? v.text : ''
               if (value && /^-?\d+(\.0+)?$/.test(value)) value = value.replace(/\.0+$/, '')
+              const width = zeroWidths[Number(cell.attrs.s || 0)] || 0
+              if (width && /^\d+$/.test(value)) value = value.padStart(width, '0')
             }
             cells[index] = value
           }
@@ -889,7 +901,7 @@ window.__ModuleLoader__.load({
 
     function keyFor(label, dictId, index, used) {
       let base = dictId || String(label || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '')
-      if (!base) base = 'v' + (index + 1)
+      if (!base || base === 'id') base = 'v' + (index + 1)
       let key = base
       let suffix = 2
       while (used.has(key)) key = base + '_' + suffix++
@@ -952,19 +964,22 @@ window.__ModuleLoader__.load({
       if (!rows.length) return { name: name || '人口学数据', columns: [], rows: [] }
       const headerRow = options.headerRow == null ? detectHeaderRow(rows) : options.headerRow
       const header = rows[headerRow] || []
-      let idIndex = -1
-      const firstLabel = normKey(header[0])
-      if (firstLabel && ID_LABELS.some(label => normKey(label) === firstLabel)) idIndex = 0
+      const candidates = header.map((label, index) => ID_LABELS.some(id => normKey(id) === normKey(label)) ? index : -1).filter(index => index >= 0)
+      if (options.idIndex == null && candidates.length > 1) throw new Error('检测到多个编号列，请明确选择编号列')
+      const idIndex = options.idIndex == null ? (candidates[0] ?? -1) : Number(options.idIndex)
+      if (!Number.isInteger(idIndex) || idIndex < -1 || idIndex >= header.length) throw new Error('编号列位置无效')
       const dataRows = rows.slice(headerRow + 1)
-      const columns = buildColumns(header, dataRows, idIndex === 0 ? { skip: [0] } : {})
+      const columns = buildColumns(header, dataRows, idIndex >= 0 ? { skip: [idIndex] } : {})
       const out = rowsFromMatrix(dataRows, columns)
       if (idIndex >= 0) {
         out.forEach((row, index) => {
           const id = normText(dataRows[index] ? dataRows[index][idIndex] : '')
-          row.id = id || String(index + 1)
+          if (!id) throw new Error('编号列第 ' + (index + headerRow + 2) + ' 行为空，请补全编号或选择生成编号')
+          const width = Number(options.idWidth || 0)
+          row.id = width > 0 && /^\d+$/.test(id) ? id.padStart(width, '0') : id
         })
       }
-      if (!columns.length) {
+      if (!columns.length && idIndex < 0) {
         // single-column list: treat as one variable
         const fallback = []
         const used = new Set()
@@ -975,6 +990,7 @@ window.__ModuleLoader__.load({
           return { name: name || '人口学数据', columns: fallback, rows: [] }
         }
       }
+      assertIds(out)
       return { name: name || '人口学数据', columns, rows: out, headerRow, idIndex }
     }
 
@@ -1013,13 +1029,38 @@ window.__ModuleLoader__.load({
       return applied
     }
 
+    function assertIds(rows) {
+      const ids = new Set()
+      for (const row of rows) {
+        if (typeof row.id !== 'string' || !row.id.trim()) throw new Error('编号必须是非空字符串')
+        if (ids.has(row.id)) throw new Error('重复被试编号：' + row.id)
+        ids.add(row.id)
+      }
+    }
+
+    function nextParticipantId(rows) {
+      const numeric = rows.map(row => row.id).filter(id => /^\d+$/.test(id))
+      const width = numeric.reduce((max, id) => Math.max(max, id.startsWith('0') ? id.length : 0), 0)
+      let next = numeric.reduce((max, id) => BigInt(id) > max ? BigInt(id) : max, 0n) + 1n
+      const ids = new Set(rows.map(row => row.id))
+      while (ids.has(String(next).padStart(width, '0'))) next++
+      return String(next).padStart(width, '0')
+    }
+
     function mergeDatasets(current, incoming) {
+      assertIds(current.rows)
+      assertIds(incoming.rows)
       const columns = current.columns.map(column => ({ ...column, coding: { ...column.coding, map: { ...column.coding.map } } }))
       const mapping = new Map(columns.map(column => [normKey(column.label), column.key]))
       const used = new Set(columns.map(column => column.key))
       for (const column of incoming.columns) {
         const signature = normKey(column.label)
-        if (mapping.has(signature)) continue
+        if (mapping.has(signature)) {
+          const existing = columns.find(item => item.key === mapping.get(signature))
+          const settings = item => JSON.stringify([item.kind, item.dict || '', Boolean(item.coding?.enabled), item.coding?.missing || '', Object.entries(item.coding?.map || {}).sort(([a], [b]) => a.localeCompare(b))])
+          if (settings(existing) !== settings(column)) throw new Error('变量编码冲突：' + column.label + '。类型、词典或映射不同，请先统一后追加')
+          continue
+        }
         const copy = { ...column, coding: { ...column.coding, map: { ...column.coding.map } } }
         copy.key = keyFor(copy.label, copy.dict, columns.length, used)
         columns.push(copy)
@@ -1032,7 +1073,12 @@ window.__ModuleLoader__.load({
           const target = mapping.get(normKey(column.label))
           if (target) values[target] = normText(row.values[column.key])
         }
-        rows.push({ id: String(rows.length + 1), values })
+        const existing = rows.find(item => item.id === row.id)
+        if (existing) {
+          const identical = columns.every(column => normText(existing.values[column.key]) === normText(values[column.key]))
+          throw new Error('编号冲突：' + row.id + '（' + (identical ? '内容相同' : '内容不同') + '）。本批未追加，请先核对并移除重复记录或更正原始编号')
+        }
+        rows.push({ id: row.id, values })
       }
       return { name: current.name, columns, rows }
     }
@@ -1068,18 +1114,24 @@ window.__ModuleLoader__.load({
       return toCsv(rows)
     }
 
-    function datasetJson(dataset) {
-      return JSON.stringify({
-        name: dataset.name,
-        exportedAt: new Date().toISOString(),
-        columns: dataset.columns.map(column => ({
-          key: column.key,
-          label: column.label,
-          kind: column.kind,
-          coding: column.coding && column.coding.enabled ? { map: column.coding.map, missing: column.coding.missing || '' } : null
-        })),
-        rows: dataset.rows.map((row, index) => ({ id: normText(row.id) || String(index + 1), ...row.values }))
-      }, null, 2)
+    function datasetJson(dataset, study = null) {
+      return JSON.stringify({ schemaVersion: 2, exportedAt: new Date().toISOString(), ...(study ? { study } : {}), dataset: cloneDataset(dataset) }, null, 2)
+    }
+
+    function parseSnapshot(text) {
+      const parsed = JSON.parse(String(text).replace(/^\ufeff/, ''))
+      if (parsed.schemaVersion !== 2 || !parsed.dataset) throw new Error('需要 schemaVersion=2 的完整人口学快照；旧扁平镜像由 Host 兼容读取')
+      const dataset = cloneDataset(parsed.dataset)
+      if (!Array.isArray(dataset.columns) || !Array.isArray(dataset.rows)) throw new Error('快照缺少变量或记录')
+      const keys = new Set()
+      for (const column of dataset.columns) {
+        if (!column || typeof column.key !== 'string' || !column.key || column.key === 'id' || keys.has(column.key)) throw new Error('快照变量 key 无效或重复')
+        keys.add(column.key)
+        if (!column.coding || typeof column.coding.map !== 'object' || !column.coding.map || Array.isArray(column.coding.map)) throw new Error('快照缺少完整编码配置')
+      }
+      assertIds(dataset.rows)
+      for (const row of dataset.rows) if (!row.values || typeof row.values !== 'object' || Array.isArray(row.values) || Object.prototype.hasOwnProperty.call(row.values, 'id')) throw new Error('快照原始 values 无效')
+      return dataset
     }
 
     function fileStem() {
@@ -1138,52 +1190,51 @@ window.__ModuleLoader__.load({
      * local storage
      * ================================================================== */
 
-    function loadDataset() {
+    function draftKey(studyId) { return 'dc:dataset:v2:' + studyId }
+
+    function loadDataset(studyId) {
       try {
-        const raw = localStorage.getItem(LS_DATA)
+        if (!studyId) return null
+        const raw = localStorage.getItem(draftKey(studyId))
         if (!raw) return null
-        const parsed = JSON.parse(raw)
-        if (!parsed || !Array.isArray(parsed.columns) || !Array.isArray(parsed.rows)) return null
-        parsed.columns = parsed.columns.map(column => ({
-          key: String(column.key),
-          label: String(column.label || column.key),
-          kind: column.kind === 'number' ? 'number' : column.kind === 'categorical' ? 'categorical' : 'text',
-          dict: String(column.dict || ''),
-          coding: {
-            enabled: Boolean(column.coding && column.coding.enabled),
-            map: (column.coding && column.coding.map) || {},
-            missing: (column.coding && column.coding.missing) || ''
-          },
-          source: Number.isFinite(column.source) ? column.source : 0
-        }))
-        parsed.rows = parsed.rows.map((row, index) => ({
-          id: String(row.id || index + 1),
-          values: row.values && typeof row.values === 'object' ? row.values : {}
-        }))
-        return { name: String(parsed.name || '人口学数据'), columns: parsed.columns, rows: parsed.rows }
+        const envelope = JSON.parse(raw)
+        if (envelope.studyId !== studyId) return null
+        return { ...envelope, dataset: parseSnapshot(datasetJson(envelope.dataset)) }
+
       } catch {
         return null
       }
     }
 
+    const PAGE_KEY = 'dsh:research:page:v2'
+    function randomPageId() { const bytes = new Uint8Array(12); if (window.crypto && window.crypto.getRandomValues) window.crypto.getRandomValues(bytes); else for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256); return Array.from(bytes, v => v.toString(16).padStart(2, '0')).join('') }
+    function pageId() { try { const own = sessionStorage.getItem(PAGE_KEY); if (own) return own; let shared = localStorage.getItem(PAGE_KEY + ':default'); if (!shared) { shared = randomPageId(); localStorage.setItem(PAGE_KEY + ':default', shared) } return shared } catch { return 'pagemem00000001' } }
+    function newPage() { const fresh = randomPageId(); try { sessionStorage.setItem(PAGE_KEY, fresh); localStorage.setItem(PAGE_KEY + ':default', fresh) } catch { } return fresh }
+    let activeBinding = null
+    const sourceLabel = { page: '页面连接', session: '会话连接', workspace: '工作区记录', project: '工作区项目配置', legacy: '旧配置来源', candidate: '候选研究', empty: '空研究', explicit: '已连接' }
+
     async function hostCall(action, payload) {
       const response = await fetch(API, {
         method: 'POST',
-        headers: { 'content-type': 'application/json', 'x-demographic-coder': '1' },
-        body: JSON.stringify({ action, payload: payload || {} })
+        headers: { 'content-type': 'application/json', 'x-demographic-coder': '1', 'x-dsh-page': pageId() },
+        body: JSON.stringify({ action, payload: { ...(payload || {}), pageId: pageId(), binding: activeBinding } })
       })
       const body = await response.json().catch(() => null)
       if (!response.ok || !body || !body.ok) {
         const message = body && body.error && body.error.message ? body.error.message : 'HTTP ' + response.status
-        throw new Error(message)
+        const error = new Error(message)
+        error.code = body?.error?.code
+        throw error
       }
+      if (body.data && body.data.binding && body.data.binding.token) activeBinding = body.data.binding.token
       return body.data
     }
 
     async function hostStatus() {
-      const response = await fetch(API + '?action=status', { headers: { 'x-demographic-coder': '1' } })
+      const response = await fetch(API + '?action=status&pageId=' + encodeURIComponent(pageId()), { headers: { 'x-demographic-coder': '1', 'x-dsh-page': pageId() } })
       const body = await response.json().catch(() => null)
       if (!response.ok || !body || !body.ok) throw new Error('人口学录入的本地接口不可用')
+      if (body.data && body.data.binding && body.data.binding.token) activeBinding = body.data.binding.token
       return body.data
     }
 
@@ -1202,6 +1253,11 @@ window.__ModuleLoader__.load({
     async function readFileMatrix(file) {
       const name = String(file.name || '')
       const lower = name.toLowerCase()
+      if (lower.endsWith('.json')) {
+        const text = await file.text()
+        const document = JSON.parse(text.replace(/^\ufeff/, ''))
+        return { kind: 'snapshot', name, dataset: parseSnapshot(text), study: document.study || (document.studyId ? { id: document.studyId } : null), sheets: [] }
+      }
       if (lower.endsWith('.xlsx') || lower.endsWith('.xlsm')) {
         const sheets = await parseXlsx(await file.arrayBuffer())
         return { kind: 'xlsx', name, sheets, pairs: null }
@@ -1304,6 +1360,16 @@ window.__ModuleLoader__.load({
       )
     }
 
+    function valueProblem(column, value) {
+      const raw = normText(value)
+      if (!raw) return column.required ? '此项必填' : ''
+      if (column.kind !== 'number') return ''
+      if (!Number.isFinite(Number(raw))) return '需要有效数值；原文保留供修改'
+      if (Number.isFinite(column.min) && Number(raw) < column.min) return '低于下限 ' + column.min
+      if (Number.isFinite(column.max) && Number(raw) > column.max) return '高于上限 ' + column.max
+      return ''
+    }
+
     function codeState(column, value) {
       const raw = normText(value)
       if (!raw) return { code: '', known: false }
@@ -1323,6 +1389,8 @@ window.__ModuleLoader__.load({
       const legend = options.slice(0, 4).map(option => option.label + '=' + option.code).join(' · ')
       const showCode = Boolean(normText(value)) && state.known && state.code !== normText(value)
       const unmapped = Boolean(normText(value)) && Boolean(options.length) && !state.known
+      const problem = valueProblem(column, value)
+      const suggestions = suggestDictValue(CODING_BY_ID[column.dict], value)
       return h(
         'div',
         { className: 'dc-field' },
@@ -1336,6 +1404,8 @@ window.__ModuleLoader__.load({
         h(
           'div',
           { className: 'dc-field-foot' },
+          problem ? h('span', { className: 'dc-code dc-code-warn', role: 'alert' }, problem) : null,
+          suggestions.length ? h('span', { className: 'dc-legend' }, '候选（未应用）：' + suggestions.map(option => option.label).join(' / ')) : null,
           showCode ? h('span', { className: 'dc-code' }, '→ ' + state.code) : null,
           unmapped ? h('span', { className: 'dc-code dc-code-warn' }, t('该值不会编码')) : null,
           options.length && !showCode && !unmapped ? h('span', { className: 'dc-legend' }, legend) : null
@@ -1349,14 +1419,7 @@ window.__ModuleLoader__.load({
       const [draft, setDraft] = useState({})
       const [duplicate, setDuplicate] = useState(-1)
       const firstRef = useRef(null)
-      const nextId = useMemo(() => {
-        let max = 0
-        for (const row of dataset.rows) {
-          const parsed = parseInt(row.id, 10)
-          if (Number.isFinite(parsed) && parsed > max) max = parsed
-        }
-        return String(max + 1)
-      }, [dataset.rows])
+      const nextId = useMemo(() => nextParticipantId(dataset.rows), [dataset.rows])
       const [draftId, setDraftId] = useState(nextId)
 
       useEffect(() => setDraftId(nextId), [nextId])
@@ -1387,6 +1450,8 @@ window.__ModuleLoader__.load({
           values[column.key] = canonical
           if (canonical) filled++
         }
+        const invalid = columns.find(column => valueProblem(column, values[column.key]))
+        if (invalid) { flash('bad', invalid.label + '：' + valueProblem(invalid, values[invalid.key])); return }
         if (!filled) {
           flash('warn', t('至少填写一项'))
           focusFirst()
@@ -1398,7 +1463,9 @@ window.__ModuleLoader__.load({
           flash('warn', t('与第N份相同', { n: same + 1 }) + '，' + t('再按一次确认'))
           return
         }
-        addRow({ id: normText(draftId) || nextId, values })
+        const id = normText(draftId) || nextId
+        if (dataset.rows.some(row => row.id === id)) { flash('bad', '编号冲突：' + id + '，请核对；当前表单保留'); return }
+        addRow({ id, values })
         setDraft({})
         setDuplicate(-1)
         flash('ok', t('已录入', { n: dataset.rows.length + 1 }))
@@ -1583,12 +1650,7 @@ window.__ModuleLoader__.load({
 
       const addBlank = () => {
         setDataset(prev => {
-          let max = 0
-          for (const row of prev.rows) {
-            const parsed = parseInt(row.id, 10)
-            if (Number.isFinite(parsed) && parsed > max) max = parsed
-          }
-          return { ...prev, rows: [...prev.rows, { id: String(max + 1), values: {} }] }
+          return { ...prev, rows: [...prev.rows, { id: nextParticipantId(prev.rows), values: {} }] }
         })
       }
 
@@ -1697,6 +1759,8 @@ window.__ModuleLoader__.load({
                         : h('input', {
                             className: 'dc-cell-input',
                             value: row.values[column.key] || '',
+                            'aria-invalid': Boolean(valueProblem(column, row.values[column.key])),
+                            title: valueProblem(column, row.values[column.key]) || column.label,
                             onChange: event => setCell(index, column.key, event.target.value)
                           })
                     )
@@ -1718,6 +1782,22 @@ window.__ModuleLoader__.load({
     }
 
     /* --------------------------------------------------------------- coding */
+
+    function DimensionAdder({ onAdd }) {
+      const [value, setValue] = useState('')
+      const [code, setCode] = useState('')
+      return h('form', {
+        className: 'dc-dimadd',
+        onSubmit: event => {
+          event.preventDefault()
+          if (!normText(value)) return
+          if (onAdd(value, code)) { setValue(''); setCode('') }
+        }
+      },
+        h('input', { className: 'dc-input dc-dimadd-value', value, placeholder: '新增取值', 'aria-label': '新增取值', onChange: event => setValue(event.target.value) }),
+        h('input', { className: 'dc-input dc-dimadd-code', value, placeholder: '编码', 'aria-label': '新增取值的编码', onChange: event => setCode(event.target.value) }),
+        h('button', { type: 'submit', className: 'dc-btn dc-btn-secondary dc-btn-sm' }, '添加取值'))
+    }
 
     function CodingTab({ dataset, setDataset, flash }) {
       const t = useT()
@@ -1747,6 +1827,73 @@ window.__ModuleLoader__.load({
             return { ...item, coding: { ...item.coding, enabled: true, map } }
           })
         }))
+      }
+
+      const ignoredEntries = column => (column.coding.ignored || [])
+        .map(item => typeof item === 'string' ? { value: item, code: '' } : item)
+        .filter(item => item && item.value)
+
+      const syncMap = column => {
+        const dict = (column.dict && CODING_BY_ID[column.dict]) || matchDictByLabel(column.label)
+        const ignored = new Set(ignoredEntries(column).map(item => item.value))
+        const map = { ...column.coding.map }
+        for (const value of uniqueOf(dataset.rows.map(row => row.values[column.key]))) {
+          if (ignored.has(value) || map[value] !== undefined) continue
+          const auto = dict ? matchDictValue(dict, value) : null
+          map[value] = auto != null ? String(auto) : value
+        }
+        return { map, dictId: dict ? dict.id : column.dict }
+      }
+
+      const toggleCoding = (column, enabled) => {
+        if (!enabled) {
+          patchColumn(column.key, { coding: { ...column.coding, enabled: false } })
+          return
+        }
+        const { map, dictId } = syncMap(column)
+        patchColumn(column.key, { dict: dictId || column.dict, coding: { ...column.coding, enabled: true, map } })
+      }
+
+      const syncColumn = column => {
+        const { map, dictId } = syncMap(column)
+        patchColumn(column.key, { dict: dictId || column.dict, coding: { ...column.coding, enabled: true, map } })
+        flash('ok', '已同步已填取值')
+      }
+
+      const addDimension = (column, value, code) => {
+        const text = normText(value)
+        if (!text) return false
+        const existing = new Set([
+          ...uniqueOf(dataset.rows.map(row => row.values[column.key])),
+          ...Object.keys(column.coding.map || {}),
+          ...effectiveOptions(column).map(option => option.label)
+        ])
+        if (existing.has(text)) {
+          flash('warn', '该取值已存在')
+          return false
+        }
+        const map = { ...column.coding.map, [text]: normText(code) }
+        const ignored = ignoredEntries(column).filter(item => item.value !== text)
+        patchColumn(column.key, { coding: { ...column.coding, enabled: true, map, ignored } })
+        flash('ok', '已添加取值 ' + text)
+        return true
+      }
+
+      const removeDimension = (column, value) => {
+        const map = { ...column.coding.map }
+        const code = map[value] === undefined ? '' : String(map[value])
+        delete map[value]
+        const ignored = [...ignoredEntries(column).filter(item => item.value !== value), { value, code }]
+        patchColumn(column.key, { coding: { ...column.coding, map, ignored } })
+      }
+
+      const restoreDimension = (column, value) => {
+        const entries = ignoredEntries(column)
+        const entry = entries.find(item => item.value === value)
+        const ignored = entries.filter(item => item.value !== value)
+        const map = { ...column.coding.map }
+        if (map[value] === undefined) map[value] = entry?.code || value
+        patchColumn(column.key, { coding: { ...column.coding, enabled: true, map, ignored } })
       }
 
       const runAutoCode = column => {
@@ -1801,7 +1948,7 @@ window.__ModuleLoader__.load({
           { className: 'dc-section-head' },
           h('div', null,
             h('h2', null, t('变量与编码')),
-            h('p', null, '分类变量按「原始值 = 编码」导出；留空的编码按内置词典自动匹配（如 男=1、女=2）。')
+            h('p', null, '分类变量按「原始值 = 编码」导出；词典只自动使用精确匹配，模糊候选需手动确认。')
           )
         ),
         h(
@@ -1811,7 +1958,9 @@ window.__ModuleLoader__.load({
             const options = effectiveOptions(column)
             const observed = uniqueMap[column.key] || []
             const dict = column.dict ? CODING_BY_ID[column.dict] : null
-            const shownAll = observed.length ? observed : options.map(option => option.label)
+            const ignored = ignoredEntries(column)
+            const ignoredSet = new Set(ignored.map(item => item.value))
+            const shownAll = [...new Set([...observed, ...options.map(option => option.label)])].filter(value => !ignoredSet.has(value))
             const shown = shownAll.slice(0, 40)
             return h(
               'section',
@@ -1825,7 +1974,7 @@ window.__ModuleLoader__.load({
                 ),
                 h(Chip, { tone: column.kind === 'categorical' ? 'brand' : column.kind === 'number' ? 'muted' : 'plain' },
                   column.kind === 'categorical' ? t('分类') : column.kind === 'number' ? t('数值') : t('文本')),
-                h('span', { className: 'dc-card-count' }, observed.length + ' ' + t('所有值'))
+                h('span', { className: 'dc-card-count' }, shownAll.length + ' ' + t('所有值'))
               ),
               h(
                 'div',
@@ -1845,11 +1994,13 @@ window.__ModuleLoader__.load({
                   h('input', {
                     type: 'checkbox',
                     checked: Boolean(column.coding.enabled),
-                    onChange: event => patchColumn(column.key, { coding: { ...column.coding, enabled: event.target.checked } })
+                    onChange: event => toggleCoding(column, event.target.checked)
                   }),
                   h('span', null, '编码')
                 ),
+                h('label', { className: 'dc-inline' }, '缺失导出值', h('input', { className: 'dc-map-input', value: column.coding.missing ?? '', onChange: event => patchColumn(column.key, { coding: { ...column.coding, missing: event.target.value } }) })),
                 h(Btn, { variant: 'ghost', size: 'sm', onClick: () => runAutoCode(column) }, t('自动编码')),
+                h(Btn, { variant: 'ghost', size: 'sm', onClick: () => syncColumn(column) }, '同步取值'),
                 confirmDel === column.key
                   ? h(
                       'span',
@@ -1879,7 +2030,14 @@ window.__ModuleLoader__.load({
                           title: '留空按词典自动编码',
                           onChange: event => setMapping(column, value, event.target.value)
                         }),
-                        auto == null && !override ? h('span', { className: 'dc-map-warn', title: t('未编码') }, '!') : null
+                        auto == null && !override ? h('span', { className: 'dc-map-warn', title: t('未编码') }, '!') : null,
+                        h('button', {
+                          type: 'button',
+                          className: 'dc-map-del',
+                          title: '从编码维度移除（原始数据仍保留）',
+                          'aria-label': '移除取值 ' + value,
+                          onClick: event => { event.preventDefault(); event.stopPropagation(); removeDimension(column, value) }
+                        }, '×')
                       )
                     }),
                     shownAll.length > shown.length
@@ -1887,11 +2045,19 @@ window.__ModuleLoader__.load({
                       : null
                   )
                 : h('p', { className: 'dc-card-note' }, column.coding.enabled ? t('导入问卷或选择模板后即可录入') : '编码已关闭，导出原始文本。'),
+              column.coding.enabled ? h(DimensionAdder, { onAdd: (value, code) => addDimension(column, value, code) }) : null,
+              ignored.length
+                ? h('details', { className: 'dc-ignored' },
+                    h('summary', null, '已移除的取值（' + ignored.length + '）'),
+                    ignored.map(entry => h('div', { key: entry.value, className: 'dc-ignored-row' },
+                      h('span', null, entry.value),
+                      h(Btn, { variant: 'ghost', size: 'sm', onClick: () => restoreDimension(column, entry.value) }, '恢复'))))
+                : null,
               h(
                 'footer',
                 { className: 'dc-card-foot' },
                 h('span', null, '导出：'),
-                h('code', null, options.map(option => option.label + '=' + option.code).slice(0, 6).join(' · ') || '—'),
+                h('code', null, options.map(option => option.label + '=' + option.code).slice(0, 10).join(' · ') || '—'),
                 column.coding.missing ? h('span', { className: 'dc-missing' }, '缺失=' + column.coding.missing) : null
               )
             )
@@ -1926,13 +2092,17 @@ window.__ModuleLoader__.load({
 
     /* --------------------------------------------------------------- import */
 
-    function ImportTab({ dataset, setDataset, dir, setDir, host, flash, go }) {
+    function ImportTab({ dataset, setDataset, dir, setDir, host, flash, go, selectStudy }) {
       const t = useT()
       const [pending, setPending] = useState(null)
       const [error, setError] = useState('')
       const [busy, setBusy] = useState(false)
       const [drag, setDrag] = useState(false)
       const [confirmTemplate, setConfirmTemplate] = useState('')
+      const [studyPath, setStudyPath] = useState(host.study?.path || '')
+      const [studyName, setStudyName] = useState('')
+      const [studyId, setStudyId] = useState('')
+      const [dataRoot, setDataRoot] = useState('')
       const inputRef = useRef(null)
 
       const handleFile = async file => {
@@ -1942,6 +2112,7 @@ window.__ModuleLoader__.load({
         setPending(null)
         try {
           const parsed = await readFileMatrix(file)
+          if (parsed.kind === 'snapshot') { setPending({ ...parsed, sheetIndex: 0, headerRow: 0 }); return }
           if ((!parsed.sheets || !parsed.sheets.length) && parsed.pairs) {
             setPending({
               name: parsed.name,
@@ -1983,18 +2154,30 @@ window.__ModuleLoader__.load({
 
       const preview = useMemo(() => {
         if (!pending) return null
-        if (pending.pairs) return datasetFromPairs(pending.name, pending.pairs)
-        const sheet = pending.sheets[pending.sheetIndex]
-        if (!sheet) return null
-        const built = datasetFromMatrix(stem(pending.name), sheet.matrix, { headerRow: pending.headerRow })
-        if (pending.codebook) built.codebookApplied = applyCodebook(built.columns, pending.codebook)
-        return built
+        try {
+          if (pending.dataset) return pending.dataset
+          if (pending.pairs) return datasetFromPairs(pending.name, pending.pairs)
+          const sheet = pending.sheets[pending.sheetIndex]
+          if (!sheet) return null
+          const built = datasetFromMatrix(stem(pending.name), sheet.matrix, { headerRow: pending.headerRow, idIndex: pending.idIndex, idWidth: pending.idWidth })
+          if (pending.codebook) built.codebookApplied = applyCodebook(built.columns, pending.codebook)
+          return built
+        } catch (failure) { return { error: failure.message } }
       }, [pending])
 
       const applyImport = mode => {
-        if (!preview) return
-        if (mode === 'replace') setDataset({ ...preview, name: stem(pending.name) })
-        else setDataset(prev => mergeDatasets(prev, preview))
+        if (!preview || preview.error) return
+        try {
+          if (pending.dataset && !pending.confirmStudy) {
+            setPending(prev => ({ ...prev, confirmStudy: true }))
+            setError('快照来源：' + (pending.study?.name || pending.study?.id || '未记录研究身份') + '；当前研究：' + (host.study?.name || host.studyId || '') + '。请核对后再次点击，显式确认将快照恢复到当前研究')
+            return
+          }
+          if (mode === 'replace') {
+            if (dataset.rows.length && !pending.confirmReplace) { setPending(prev => ({ ...prev, confirmReplace: true })); setError('替换将移除当前记录；核对后再次点击导入并替换'); return }
+            setDataset(pending.dataset ? cloneDataset(preview) : { ...preview, name: stem(pending.name) })
+          } else setDataset(mergeDatasets(dataset, preview))
+        } catch (failure) { setError(failure.message); return }
         flash('ok', t('导入') + ' · ' + preview.columns.length + ' ' + t('列') + ' / ' + preview.rows.length + ' ' + t('行数'))
         setPending(null)
         go('entry')
@@ -2022,6 +2205,23 @@ window.__ModuleLoader__.load({
             h('p', null, t('导入须知') + ' ' + t('本机处理'))
           )
         ),
+        h('section', { className: 'dc-folder' },
+          h('h2', null, '研究配置'),
+          h('p', null, '当前：' + (host.study?.name || '') + ' · ' + (host.study?.id || '') + ' · ' + (host.study?.dataRoot || '')),
+          h('p', { className: 'dc-hint' }, '绑定来源：' + (sourceLabel[host.binding?.source] || host.binding?.source || '未连接') + (host.binding?.instanceId ? ' · 实例 ' + String(host.binding.instanceId).slice(0, 14) : '') + '。连接只改变当前页面，其他页面与会话保留各自的研究绑定。'),
+          h('label', null, '研究 JSON 绝对路径', h('input', { className: 'dc-input', value: studyPath, onChange: event => setStudyPath(event.target.value) })),
+          h(Btn, { onClick: () => selectStudy?.(studyPath) }, '加载研究配置'),
+          h('div', { className: 'dc-folder-row' },
+            h('input', { className: 'dc-input', value: studyName, placeholder: '新研究名称', 'aria-label': '新研究名称', onChange: event => setStudyName(event.target.value) }),
+            h('input', { className: 'dc-input', value: studyId, placeholder: '新研究 studyId', 'aria-label': '新研究 studyId', onChange: event => setStudyId(event.target.value) }),
+            h('input', { className: 'dc-input', value: dataRoot, placeholder: '数据目录（相对配置文件或绝对路径）', 'aria-label': '数据目录', onChange: event => setDataRoot(event.target.value) })),
+          h(Btn, { onClick: async () => {
+            try {
+              newPage()
+              await hostCall('createStudy', { studyPath, definition: { schemaVersion: 1, studyId, name: studyName, dataRoot: dataRoot || './data', participantId: {}, visits: [], tasks: [], followups: [], plugins: { demographics: {} } } })
+              selectStudy?.(studyPath)
+            } catch (failure) { setError(failure.message) }
+          } }, '创建并加载研究 JSON')),
         h(
           'div',
           {
@@ -2042,7 +2242,7 @@ window.__ModuleLoader__.load({
           h('input', {
             ref: inputRef,
             type: 'file',
-            accept: '.xlsx,.xlsm,.docx,.csv,.txt',
+            accept: '.xlsx,.xlsm,.docx,.csv,.txt,.json',
             style: { display: 'none' },
             onChange: event => {
               const file = event.target.files && event.target.files[0]
@@ -2101,9 +2301,15 @@ window.__ModuleLoader__.load({
                       })
                     )
                   : null,
+                pending.sheets.length ? h('label', { className: 'dc-inline' }, '编号列',
+                  h('select', { className: 'dc-select', value: pending.idIndex ?? 'auto', onChange: event => setPending(prev => ({ ...prev, idIndex: event.target.value === 'auto' ? undefined : Number(event.target.value) })) },
+                    h('option', { value: 'auto' }, '自动识别'), h('option', { value: -1 }, '生成编号'),
+                    (pending.sheets[pending.sheetIndex].matrix[pending.headerRow] || []).map((label, index) => h('option', { key: index, value: index }, (index + 1) + ': ' + (label || '空表头'))))) : null,
+                pending.sheets.length ? h('label', { className: 'dc-inline' }, '数字编号补零宽度（可选）',
+                  h('input', { className: 'dc-input dc-input-num', type: 'number', min: 0, max: 100, value: pending.idWidth || '', onChange: event => setPending(prev => ({ ...prev, idWidth: Math.min(100, Math.max(0, Number(event.target.value) || 0)) })) })) : null,
                 pending.codebook ? h(Chip, { tone: 'ok' }, t('检测到编码表')) : null
               ),
-              preview
+              preview?.error ? h('div', { className: 'dc-alert dc-alert-bad', role: 'alert' }, preview.error) : preview
                 ? h(
                     'div',
                     { className: 'dc-preview-body' },
@@ -2174,11 +2380,11 @@ window.__ModuleLoader__.load({
             h('input', {
               className: 'dc-input',
               value: dir,
-              placeholder: host.defaultDir || 'D:\\论文\\数据',
+              placeholder: host.defaultDir || '研究导出目录',
               onChange: event => {
                 setDir(event.target.value)
                 try {
-                  localStorage.setItem(LS_DIR, event.target.value)
+                  localStorage.setItem(LS_DIR + ':' + host.studyId, event.target.value)
                 } catch {}
               }
             }),
@@ -2188,13 +2394,13 @@ window.__ModuleLoader__.load({
               onClick: () => {
                 setDir(host.defaultDir || '')
                 try {
-                  localStorage.setItem(LS_DIR, host.defaultDir || '')
+                  localStorage.setItem(LS_DIR + ':' + host.studyId, host.defaultDir || '')
                 } catch {}
               }
             }, '恢复默认'),
             host.state === 'error' ? h(Chip, { tone: 'bad' }, '本地接口不可用') : null
           ),
-          h('p', { className: 'dc-hint' }, 'CSV 与编码手册会写入该文件夹；数据同时保留在本机浏览器里，刷新不丢。')
+          h('p', { className: 'dc-hint' }, 'CSV、编码手册与完整 JSON 快照写入此文件夹；主数据由 Host 保存，浏览器保留此研究的编辑草稿。')
         )
       )
     }
@@ -2244,7 +2450,7 @@ window.__ModuleLoader__.load({
           return h('div', {
             style: {
               padding: '18px',
-              fontFamily: 'ui-monospace,Consolas,monospace',
+              fontFamily: 'Cambria,"Noto Serif SC","Source Han Serif SC","Songti SC",STSong,SimSun,serif',
               fontSize: '12px',
               lineHeight: 1.6,
               whiteSpace: 'pre-wrap',
@@ -2268,7 +2474,17 @@ window.__ModuleLoader__.load({
 
     function Panel() {
       const t = useT()
-      const [dataset, setDataset] = useState(() => loadDataset() || templateDataset('core'))
+      const [dataset, replaceDataset] = useState(() => emptyDataset())
+      const [loaded, setLoaded] = useState(false)
+      const [persistence, setPersistence] = useState('正在加载磁盘数据…')
+      const [recovery, setRecovery] = useState(null)
+      const [retry, setRetry] = useState(0)
+      const syncRef = useRef({ studyId: null, studyPath: null, studyRevision: null, bindingRevision: null, revision: null, saved: null, blocked: false, busy: false })
+      const currentRef = useRef(dataset)
+      currentRef.current = dataset
+      const setDataset = useCallback(change => {
+        replaceDataset(previous => typeof change === 'function' ? change(previous) : change)
+      }, [])
       const [tab, setTab] = useState(() => {
         try {
           return localStorage.getItem(LS_TAB) || 'entry'
@@ -2277,22 +2493,38 @@ window.__ModuleLoader__.load({
         }
       })
       const [notice, setNotice] = useState(null)
-      const [dir, setDir] = useState(() => {
-        try {
-          return localStorage.getItem(LS_DIR) || ''
-        } catch {
-          return ''
-        }
-      })
+      const [dir, setDir] = useState('')
       const [host, setHost] = useState({ state: 'idle', defaultDir: '' })
       const [saving, setSaving] = useState(false)
       const [saved, setSaved] = useState(null)
 
-      useEffect(() => {
-        hostStatus()
-          .then(data => setHost({ state: 'ok', defaultDir: data.defaultDir || '' }))
-          .catch(() => setHost({ state: 'error', defaultDir: '' }))
+      const loadHost = useCallback(async (requestedPath = undefined) => {
+        if (syncRef.current.studyId && JSON.stringify(currentRef.current) !== syncRef.current.saved && typeof window.confirm === 'function' && !window.confirm('当前编辑尚未保存到磁盘。请先下载 JSON 快照；继续将重新加载磁盘，浏览器草稿保留。')) return
+        if (syncRef.current.busy) { setPersistence('正在保存，请完成后重新加载'); return }
+        setLoaded(false)
+        setPersistence('正在加载磁盘数据…')
+        try {
+          if (typeof requestedPath === 'string') { newPage(); await hostCall('studyConnect', { studyPath: requestedPath }) }
+          const studyPath = undefined
+          const [status, data] = await Promise.all([hostCall('status', { studyPath }), hostCall('load', { studyPath })])
+          const initial = data.dataset || emptyDataset()
+          syncRef.current = { studyId: data.studyId, studyPath: data.study?.path || null, studyRevision: data.studyRevision, bindingRevision: data.binding?.bindingRevision ?? null, revision: data.revision, saved: JSON.stringify(initial), blocked: false, busy: false }
+          replaceDataset(initial)
+          setHost({ state: 'ok', defaultDir: status.defaultDir || '', studyId: data.studyId, study: data.study, binding: data.binding })
+          try {
+            const savedDir = localStorage.getItem(LS_DIR + ':' + data.studyId)
+            setDir(savedDir || '')
+            const draft = loadDataset(data.studyId)
+            setRecovery(draft && JSON.stringify(draft.dataset) !== JSON.stringify(initial) ? draft : null)
+          } catch { setPersistence('磁盘已加载；浏览器草稿存储不可用') }
+          setLoaded(true)
+          setPersistence('磁盘已加载 · 未修改')
+        } catch (failure) {
+          setHost({ state: 'error', defaultDir: '' })
+          setPersistence('加载失败：' + failure.message + '。请重试加载')
+        }
       }, [])
+      useEffect(() => { loadHost() }, [loadHost])
 
       useEffect(() => {
         try {
@@ -2301,26 +2533,68 @@ window.__ModuleLoader__.load({
       }, [tab])
 
       useEffect(() => {
-        const timer = setTimeout(() => {
+        if (!loaded) return
+        const state = syncRef.current
+        const serialized = JSON.stringify(dataset)
+        if (serialized === state.saved) return
+        let draftWarning = ''
+        try {
+          // Write immediately; a failed Host save must leave a recoverable draft.
+          localStorage.setItem(draftKey(state.studyId), JSON.stringify({ studyId: state.studyId, revision: state.revision, dataset }))
+        } catch { draftWarning = '；浏览器草稿写入失败，请下载 JSON 快照'; }
+        if (state.blocked) { setPersistence('版本冲突，草稿未保存到磁盘；请下载快照后重新加载' + draftWarning); return }
+        setPersistence('尚未保存到磁盘' + draftWarning)
+        const timer = setTimeout(async () => {
+          if (state.busy || state.blocked) return
+          state.busy = true
+          setPersistence('正在保存到磁盘…' + draftWarning)
           try {
-            localStorage.setItem(LS_DATA, JSON.stringify(dataset))
-          } catch {}
-        }, 300)
+            const result = await hostCall('sync', { studyPath: state.studyPath, studyRevision: state.studyRevision, studyId: state.studyId, revision: state.revision, dataset })
+            state.revision = result.revision
+            state.saved = serialized
+            // 打开 publishFlow 时，核心发布失败必须让人看见，不能只说"已保存"。
+            const publishNote = result.flowError
+              ? '；发布到研究核心失败：' + result.flowError
+              : (result.flow && result.flow.participants ? '；已发布参与者 ' + (result.flow.participants.created || []).length + ' 人、待关联 ' + (result.flow.participants.pending || []).length + ' 人' : '')
+            setPersistence('已保存到磁盘' + publishNote + draftWarning)
+            // A newer edit may have arrived while the request was in flight.
+            if (JSON.stringify(currentRef.current) !== serialized) setRetry(value => value + 1)
+          } catch (failure) {
+            if (['conflict', 'study_mismatch'].includes(failure.code)) state.blocked = true
+            setPersistence('保存失败：' + failure.message + '。草稿保留，可下载 JSON 快照' + draftWarning)
+          } finally { state.busy = false }
+        }, 700)
         return () => clearTimeout(timer)
-      }, [dataset])
+      }, [dataset, loaded, retry])
 
-      // 把当前数据集镜像到 <项目>/_lab/demographics.json，
-      // 实验运行台据此显示「人口学完成度」。镜像失败不影响录入。
       useEffect(() => {
-        const timer = setTimeout(() => {
-          hostCall('sync', {
-            name: dataset.name,
-            columns: dataset.columns.map(column => ({ key: column.key, label: column.label, kind: column.kind })),
-            rows: dataset.rows.map((row, index) => ({ id: normText(row.id) || String(index + 1), ...row.values }))
-          }).catch(() => {})
-        }, 1200)
-        return () => clearTimeout(timer)
-      }, [dataset])
+        if (!loaded) return
+        let disposed = false
+        const inspect = async () => {
+          try {
+            const status = await hostCall('status')
+            const state = syncRef.current
+            const currentBinding = status.binding?.bindingRevision ?? null
+            const staleBinding = state.bindingRevision !== null && currentBinding !== null && currentBinding !== state.bindingRevision
+            if (!disposed && (status.study?.id !== state.studyId || status.study?.revision !== state.studyRevision || staleBinding)) {
+              state.blocked = true
+              setPersistence('研究已由其他页面切换或定义已更新；编辑内容保留为草稿，请下载快照后重新加载')
+            }
+          } catch (failure) { if (!disposed) { syncRef.current.blocked = true; setPersistence('研究状态检查失败：' + failure.message + '；草稿保留，请重新加载') } }
+        }
+        const timer = setInterval(inspect, 5000)
+        timer?.unref?.()
+        window.addEventListener?.('focus', inspect)
+        return () => { disposed = true; clearInterval(timer); window.removeEventListener?.('focus', inspect) }
+      }, [loaded])
+
+      useEffect(() => {
+        const warn = event => {
+          if (JSON.stringify(currentRef.current) !== syncRef.current.saved) { event.preventDefault(); event.returnValue = '' }
+        }
+        window.addEventListener?.('beforeunload', warn)
+        return () => window.removeEventListener?.('beforeunload', warn)
+      }, [])
 
       useEffect(() => {
         if (!notice) return
@@ -2351,11 +2625,12 @@ window.__ModuleLoader__.load({
         setSaving(true)
         try {
           const result = await hostCall('save', {
+            studyId: syncRef.current.studyId, studyRevision: syncRef.current.studyRevision,
             name: dataset.name,
             dir: targetDir,
             csv: '\ufeff' + datasetCsv(dataset),
             codebook: '\ufeff' + codebookCsv(dataset),
-            json: datasetJson(dataset)
+            json: datasetJson(dataset, host.study)
           })
           const primary = result.files.find(file => file.kind === 'data')
           setSaved({
@@ -2370,6 +2645,14 @@ window.__ModuleLoader__.load({
         } finally {
           setSaving(false)
         }
+      }
+
+      const downloadSnapshot = () => {
+        const blob = new Blob([datasetJson(dataset, host.study)], { type: 'application/json;charset=utf-8' })
+        const url = URL.createObjectURL(blob)
+        const anchor = document.createElement('a')
+        anchor.href = url; anchor.download = dataset.name + '.json'; anchor.click()
+        setTimeout(() => URL.revokeObjectURL(url), 4000)
       }
 
       const download = () => {
@@ -2395,6 +2678,11 @@ window.__ModuleLoader__.load({
           flash('warn', saved.path)
         }
       }
+
+      if (!loaded) return h('div', { className: 'dc-root' },
+        h('div', { className: 'dc-alert', role: host.state === 'error' ? 'alert' : 'status' }, persistence),
+        host.state === 'error' ? h(Btn, { onClick: () => loadHost() }, '重试加载') : null,
+        host.state === 'error' && syncRef.current.studyPath ? h(Btn, { onClick: () => loadHost(syncRef.current.studyPath) }, '重新连接当前研究配置') : null)
 
       return h(
         'div',
@@ -2444,6 +2732,22 @@ window.__ModuleLoader__.load({
             h(Btn, { variant: 'primary', size: 'sm', onClick: saveToDisk, disabled: saving }, saving ? t('正在保存') : t('保存CSV'))
           )
         ),
+        h('div', { className: 'dc-alert', role: 'status', 'aria-live': 'polite' },
+          h('span', null, (host.study?.name || '') + ' [' + (host.study?.id || '') + '] · ' + persistence),
+          h(Btn, { variant: 'ghost', size: 'sm', onClick: downloadSnapshot }, '下载JSON快照'),
+          h(Btn, { variant: 'ghost', size: 'sm', disabled: syncRef.current.blocked, onClick: () => setRetry(value => value + 1) }, '重试保存'),
+          h(Btn, { variant: 'ghost', size: 'sm', onClick: loadHost }, '重新加载磁盘')),
+        recovery ? h('div', { className: 'dc-alert dc-alert-warn', role: 'status' },
+          '此研究有尚未恢复的浏览器草稿；磁盘数据已优先加载。',
+          h(Btn, { onClick: () => {
+            const draft = recovery
+            setRecovery(null)
+            replaceDataset(draft.dataset)
+            if (draft.revision !== syncRef.current.revision) {
+              syncRef.current.blocked = true
+              setPersistence('草稿来自旧版本，请下载快照并核对后合并')
+            }
+          } }, '恢复草稿到编辑区')) : null,
         notice
           ? h('div', { className: 'dc-alert dc-alert-' + notice.tone }, h('span', null, notice.text))
           : null,
@@ -2466,7 +2770,7 @@ window.__ModuleLoader__.load({
               ? h(DataTab, { dataset, setDataset, flash, go })
               : tab === 'coding'
                 ? h(CodingTab, { dataset, setDataset, flash })
-                : h(ImportTab, { dataset, setDataset, dir, setDir, host, flash, go })
+                : h(ImportTab, { dataset, setDataset, dir, setDir, host, flash, go, selectStudy: path => loadHost(path) })
         )
       )
     }
@@ -2502,182 +2806,316 @@ window.__ModuleLoader__.load({
      * ================================================================== */
 
     const CSS = `
-.dc-root{--dc-bg:var(--dsw-alias-bg-base,#fff);--dc-panel:var(--dsw-alias-bg-layer-1,#f7f7f8);--dc-raised:var(--dsw-alias-bg-layer-2,#f1f2f4);--dc-line:var(--dsw-alias-border-l1,rgba(0,0,0,.09));--dc-line-2:var(--dsw-alias-border-l2,rgba(0,0,0,.16));--dc-text:var(--dsw-alias-label-primary,#16181d);--dc-text-2:var(--dsw-alias-label-secondary,#5b6068);--dc-brand:var(--dsw-alias-brand-primary,#3f5efb);--dc-ok:var(--dsw-alias-state-success-primary,#148a62);--dc-warn:var(--dsw-alias-state-warn-primary,#b7791f);--dc-bad:var(--dsw-alias-state-error-primary,#c0392b);display:flex;flex-direction:column;height:100%;min-height:0;background:var(--dc-bg);color:var(--dc-text);font-size:13px;line-height:1.55;overflow:hidden}
+.dc-root{
+  --dc-bg:#f5f4ef;--dc-sunk:#eeede6;--dc-panel:#fbfaf6;--dc-raised:#fffefb;--dc-alt:#f2f0e9;
+  --dc-line:#e3dfd4;--dc-line-soft:#eceade;--dc-line-strong:#cdc7b7;
+  --dc-text:#24221f;--dc-text-2:#5b564d;--dc-text-3:#726c62;
+  --dc-accent:#c46e4f;--dc-accent-deep:#a55a3c;--dc-accent-darker:#8b4526;
+  --dc-accent-soft:#f4e5dd;--dc-accent-soft-2:#efd8cc;--dc-accent-line:#d6b3a0;--dc-on-accent:#fdfbf7;
+  --dc-ok:#3f6b4f;--dc-ok-soft:#e4ebe1;--dc-warn:#7d5810;--dc-warn-soft:#f3ead3;
+  --dc-bad:#9b3a2c;--dc-bad-soft:#f4dfd9;--dc-info:#3f5a70;--dc-info-soft:#e2e8ec;
+  display:flex;flex-direction:column;height:100%;min-height:0;
+  background:var(--dc-bg);color:var(--dc-text);color-scheme:light;
+  font-family:Cambria,"Noto Serif SC","Source Han Serif SC","Songti SC",STSong,SimSun,serif;
+  font-size:14.5px;line-height:1.6;letter-spacing:0;overflow:hidden;
+  -webkit-font-smoothing:antialiased
+}
 .dc-root *{box-sizing:border-box}
-.dc-root :where(button,input,select,textarea){font:inherit}
-.dc-root :where(input,select,textarea){color:inherit}
-.dc-root ::selection{background:color-mix(in oklab,var(--dc-brand) 26%,transparent)}
-.dc-root *{scrollbar-width:thin;scrollbar-color:var(--dc-line-2) transparent}
-.dc-top{display:flex;align-items:center;gap:14px;height:56px;padding:0 16px;border-bottom:1px solid var(--dc-line);flex:none;background:var(--dc-bg)}
-.dc-brand{display:flex;align-items:center;gap:9px;min-width:0}
-.dc-brand-text{display:flex;flex-direction:column;line-height:1.2;min-width:0}
-.dc-brand-text strong{font-size:13.5px;letter-spacing:.01em}
-.dc-name{width:168px;height:22px;padding:0 6px;border:1px solid transparent;border-radius:6px;background:transparent;color:var(--dc-text-2);font-size:11.5px;outline:none}
+.dc-root :where(button,input,select,textarea){font-family:inherit;font-size:inherit;line-height:inherit;color:inherit}
+.dc-root :where(code,kbd,pre,samp,output){font-family:inherit;color:inherit}
+.dc-root ::selection{background:var(--dc-accent-soft-2);color:var(--dc-text)}
+.dc-root *{scrollbar-width:thin;scrollbar-color:var(--dc-line-strong) transparent}
+
+/* ------------------------------------------------------------- top bar */
+.dc-top{display:flex;align-items:center;gap:20px;min-height:56px;padding:0 20px;border-bottom:1px solid var(--dc-line);flex:none;background:var(--dc-panel)}
+.dc-brand{display:flex;align-items:center;gap:10px;min-width:0}
+.dc-brand-text{display:flex;flex-direction:column;line-height:1.25;min-width:0}
+.dc-brand-text strong{font-size:15.5px;font-weight:600;letter-spacing:0;color:var(--dc-text)}
+.dc-name{width:184px;height:26px;padding:0 7px;border:1px solid transparent;border-radius:5px;background:transparent;color:var(--dc-text-2);font-size:13px;outline:none}
 .dc-name:hover{border-color:var(--dc-line)}
-.dc-name:focus{border-color:var(--dc-brand);background:var(--dc-bg);color:var(--dc-text)}
-.dc-tabs{display:flex;align-items:center;gap:2px;padding:3px;border-radius:9px;background:var(--dc-raised);border:1px solid var(--dc-line)}
-.dc-tab{border:0;background:transparent;color:var(--dc-text-2);padding:4px 13px;border-radius:7px;cursor:pointer;font-size:12.5px;white-space:nowrap}
-.dc-tab:hover{color:var(--dc-text);background:color-mix(in oklab,var(--dc-bg) 60%,transparent)}
-.dc-tab.is-active{background:var(--dc-bg);color:var(--dc-text);font-weight:600;box-shadow:0 1px 2px rgba(0,0,0,.08),0 0 0 1px var(--dc-line) inset}
-.dc-top-right{display:flex;align-items:center;gap:8px;margin-left:auto}
-.dc-total{font-size:11.5px;color:var(--dc-text-2);font-variant-numeric:tabular-nums}
-.dc-body{flex:1;min-height:0;display:flex;flex-direction:column}
-.dc-btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;height:32px;padding:0 13px;border-radius:8px;border:1px solid transparent;font-size:12.5px;cursor:pointer;white-space:nowrap;transition:background .14s ease,border-color .14s ease,color .14s ease}
-.dc-btn:disabled{opacity:.55;cursor:default}
-.dc-btn-sm{height:27px;padding:0 9px;font-size:11.5px;border-radius:7px}
+.dc-name:focus{border-color:var(--dc-line-strong);background:var(--dc-raised);color:var(--dc-text);outline:2px solid var(--dc-accent-deep);outline-offset:2px}
+.dc-tabs{display:flex;align-items:center;gap:20px;padding:0;border:0;background:transparent}
+.dc-tab{border:0;background:transparent;color:var(--dc-text-2);padding:0 2px;height:38px;display:inline-flex;align-items:center;border-bottom:2px solid transparent;border-radius:0;cursor:pointer;font-size:14.5px;white-space:nowrap}
+.dc-tab:hover{color:var(--dc-text)}
+.dc-tab.is-active{color:var(--dc-text);font-weight:600;border-bottom-color:var(--dc-accent-deep);background:transparent;box-shadow:none}
+.dc-top-right{display:flex;align-items:center;gap:10px;margin-left:auto}
+.dc-top-right .dc-btn-ghost{background:var(--dc-raised);border-color:var(--dc-line);color:var(--dc-text)}
+.dc-top-right .dc-btn-ghost:hover:not(:disabled){background:var(--dc-alt);border-color:var(--dc-line-strong)}
+/* 品牌图标保留形状，只把品牌蓝/绿换成陶土色系 */
+.dc-brand svg>rect:first-of-type{fill:var(--dc-accent-deep)}
+.dc-brand svg>rect:nth-of-type(2){fill:var(--dc-on-accent)}
+.dc-brand svg>rect:nth-of-type(n+3){fill:var(--dc-accent-deep)}
+.dc-brand svg>circle{fill:var(--dc-accent);stroke:var(--dc-accent-deep)}
+.dc-total{font-size:13px;color:var(--dc-text-2);font-variant-numeric:tabular-nums;white-space:nowrap}
+
+/* -------------------------------------------------------------- buttons */
+.dc-btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;height:34px;padding:0 14px;border-radius:5px;border:1px solid transparent;background:transparent;color:var(--dc-text);font-size:14px;font-weight:500;cursor:pointer;white-space:nowrap;transition:background .14s ease,border-color .14s ease,color .14s ease}
+.dc-btn-md{height:34px;padding:0 14px;font-size:14px}
+.dc-btn-sm{height:28px;padding:0 10px;font-size:13px;border-radius:5px}
+.dc-btn:disabled{background:var(--dc-alt);border-color:var(--dc-line);color:var(--dc-text-3);cursor:not-allowed}
 .dc-btn-default{background:var(--dc-raised);border-color:var(--dc-line);color:var(--dc-text)}
-.dc-btn-default:hover:not(:disabled){border-color:var(--dc-line-2)}
-.dc-btn-primary{background:var(--dc-brand);color:var(--dsw-alias-bg-base,#fff)}
-.dc-btn-primary:hover:not(:disabled){filter:brightness(1.06)}
-.dc-btn-secondary{background:var(--dc-bg);border-color:var(--dc-line-2);color:var(--dc-text)}
-.dc-btn-secondary:hover:not(:disabled){background:var(--dc-raised)}
-.dc-btn-ghost{background:transparent;color:var(--dc-text-2)}
-.dc-btn-ghost:hover:not(:disabled){background:var(--dc-raised);color:var(--dc-text)}
-.dc-btn-danger{background:var(--dc-bad);color:#fff}
-.dc-btn:focus-visible,.dc-tab:focus-visible,.dc-input:focus-visible,.dc-select:focus-visible,.dc-cell-input:focus-visible{outline:2px solid color-mix(in oklab,var(--dc-brand) 60%,transparent);outline-offset:1px}
-.dc-alert{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px 16px;font-size:12px;border-bottom:1px solid var(--dc-line);flex:none}
-.dc-alert-ok{color:var(--dc-ok);background:color-mix(in oklab,var(--dc-ok) 9%,transparent)}
-.dc-alert-warn{color:var(--dc-warn);background:color-mix(in oklab,var(--dc-warn) 10%,transparent)}
-.dc-alert-bad{color:var(--dc-bad);background:color-mix(in oklab,var(--dc-bad) 9%,transparent)}
-.dc-saved{display:flex;align-items:center;gap:8px;padding:5px 16px;border-bottom:1px solid var(--dc-line);background:color-mix(in oklab,var(--dc-ok) 7%,transparent);font-size:11.5px;flex:none}
-.dc-saved-path{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:11px;color:var(--dc-text-2)}
-.dc-saved-close{border:0;background:transparent;color:var(--dc-text-2);cursor:pointer;font-size:15px;line-height:1}
-.dc-entry,.dc-coding,.dc-import{flex:1;min-height:0;overflow:auto;padding:24px 28px 56px}
+.dc-btn-default:hover:not(:disabled){border-color:var(--dc-line-strong);background:var(--dc-panel)}
+.dc-btn-primary{background:var(--dc-accent-deep);border-color:var(--dc-accent-deep);color:var(--dc-on-accent)}
+.dc-btn-primary:hover:not(:disabled){background:var(--dc-accent-darker);border-color:var(--dc-accent-darker);color:var(--dc-on-accent)}
+.dc-btn-secondary{background:var(--dc-raised);border-color:var(--dc-line-strong);color:var(--dc-text)}
+.dc-btn-secondary:hover:not(:disabled){background:var(--dc-alt);border-color:var(--dc-text-3)}
+.dc-btn-ghost{background:transparent;border-color:transparent;color:var(--dc-text-2)}
+.dc-btn-ghost:hover:not(:disabled){background:var(--dc-alt);color:var(--dc-text)}
+.dc-btn-danger{background:var(--dc-bad);border-color:var(--dc-bad);color:var(--dc-on-accent)}
+.dc-btn-danger:hover:not(:disabled){background:#852b1f;border-color:#852b1f;color:var(--dc-on-accent)}
+.dc-btn:focus-visible,.dc-tab:focus-visible,.dc-input:focus-visible,.dc-select:focus-visible,
+.dc-cell-input:focus-visible,.dc-map-input:focus-visible,.dc-template:focus-visible,
+.dc-empty-actions .dc-btn:focus-visible,.dc-saved-close:focus-visible,.dc-row-del:focus-visible{
+  outline:2px solid var(--dc-accent-deep);outline-offset:2px
+}
+
+/* --------------------------------------------------------------- alerts */
+.dc-alert{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:9px 20px;font-size:13px;line-height:1.6;border-bottom:1px solid var(--dc-line-soft);background:var(--dc-panel);color:var(--dc-text-2);flex:none}
+.dc-alert-ok{color:var(--dc-ok);background:var(--dc-ok-soft);border-bottom-color:#cddbcb}
+.dc-alert-warn{color:var(--dc-warn);background:var(--dc-warn-soft);border-bottom-color:#e6d9b8}
+.dc-alert-bad{color:var(--dc-bad);background:var(--dc-bad-soft);border-bottom-color:#e6c6bf}
+.dc-saved{display:flex;align-items:center;gap:10px;padding:8px 20px;border-bottom:1px solid #d3ded0;background:var(--dc-ok-soft);font-size:12.5px;color:var(--dc-ok);flex:none}
+.dc-saved-path{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12.5px;line-height:1.7;letter-spacing:.012em;color:var(--dc-text-2);background:var(--dc-raised);border:1px solid #cfdac9;border-radius:4px;padding:1px 8px}
+.dc-saved-close{border:0;background:transparent;color:var(--dc-text-3);cursor:pointer;font-size:16px;line-height:1;padding:2px 4px;border-radius:4px}
+.dc-saved-close:hover{color:var(--dc-bad);background:var(--dc-bad-soft)}
+
+.dc-body{flex:1;min-height:0;display:flex;flex-direction:column}
+
+/* ---------------------------------------------------------- page shells */
+.dc-entry,.dc-coding,.dc-import{flex:1;min-height:0;overflow:auto;padding:26px 24px 52px}
 .dc-entry{display:flex;flex-direction:column}
-.dc-entry>*{width:100%;max-width:840px;margin-left:auto;margin-right:auto}
-.dc-entry-head{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin-bottom:16px}
-.dc-entry-head h2{font-size:19px;margin:0 0 3px;font-weight:650;letter-spacing:-.01em}
-.dc-entry-head p{margin:0;font-size:12px;color:var(--dc-text-2)}
-.dc-idbox{display:flex;align-items:center;gap:7px;font-size:11.5px;color:var(--dc-text-2);white-space:nowrap}
-.dc-input{width:100%;height:34px;padding:0 10px;border:1px solid var(--dc-line);border-radius:8px;background:var(--dc-bg);color:var(--dc-text);font-size:13px;outline:none;transition:border-color .14s ease,box-shadow .14s ease}
-.dc-input:hover{border-color:var(--dc-line-2)}
-.dc-input:focus{border-color:var(--dc-brand);box-shadow:0 0 0 3px color-mix(in oklab,var(--dc-brand) 16%,transparent)}
-.dc-input-id{width:76px;height:30px;text-align:center;font-variant-numeric:tabular-nums}
-.dc-form{border:1px solid var(--dc-line);border-radius:14px;background:var(--dc-panel);padding:20px 22px 18px}
-.dc-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px 24px}
-.dc-field{display:flex;flex-direction:column;gap:5px;min-width:0}
-.dc-field-head{display:flex;align-items:baseline;gap:7px}
-.dc-field-label{font-size:12.5px;font-weight:600}
-.dc-field-key{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:10px;color:var(--dc-text-2);opacity:.75}
-.dc-field-foot{min-height:15px;display:flex;gap:10px;align-items:center;font-size:10.5px}
-.dc-code{color:var(--dc-brand);font-variant-numeric:tabular-nums;font-weight:600}
-.dc-code-warn{color:var(--dc-warn);font-weight:500}
-.dc-legend{color:var(--dc-text-2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.dc-entry-foot{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-top:18px;padding-top:14px;border-top:1px dashed var(--dc-line)}
-.dc-preview{display:flex;gap:8px;align-items:baseline;font-size:11px;min-width:0}
-.dc-preview-label{color:var(--dc-text-2);white-space:nowrap}
-.dc-preview-body{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--dc-text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.dc-entry-actions{display:flex;gap:8px;align-items:center}
-.dc-recent{margin-top:22px}
-.dc-recent-head{display:flex;align-items:center;justify-content:space-between;font-size:11.5px;color:var(--dc-text-2);margin-bottom:6px}
+.dc-entry>*{width:100%;max-width:920px;margin-left:auto;margin-right:auto}
+
+/* ------------------------------------------------------------ entry card */
+.dc-entry-head{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;padding:18px 22px 15px;background:var(--dc-panel);border:1px solid var(--dc-line);border-bottom:0;border-radius:7px 7px 0 0}
+.dc-entry-head h2{font-size:21px;line-height:1.24;margin:0 0 4px;font-weight:600;letter-spacing:0;color:var(--dc-text)}
+.dc-entry-head p{margin:0;font-size:13px;color:var(--dc-text-2)}
+.dc-idbox{display:flex;align-items:center;gap:9px;font-size:13px;color:var(--dc-text-2);white-space:nowrap}
+.dc-input{width:100%;height:38px;padding:0 11px;border:1px solid var(--dc-line-strong);border-radius:5px;background:var(--dc-raised);color:var(--dc-text);font-size:14.5px;outline:none;transition:border-color .14s ease}
+.dc-input::placeholder{color:var(--dc-text-3);opacity:.85}
+.dc-input:hover{border-color:var(--dc-text-3)}
+.dc-input:focus{border-color:var(--dc-accent-deep);outline:2px solid var(--dc-accent-deep);outline-offset:2px}
+.dc-input-id,.dc-input.dc-input-id{width:88px;height:34px;text-align:center;font-variant-numeric:tabular-nums;font-size:14px}
+.dc-input.dc-input-num{width:70px;height:32px;text-align:center;font-variant-numeric:tabular-nums;font-size:13.5px}
+.dc-value{min-width:0}
+.dc-form{border:1px solid var(--dc-line);border-radius:0 0 7px 7px;background:var(--dc-panel);padding:20px 22px 0}
+.dc-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px 26px}
+.dc-field{display:flex;flex-direction:column;gap:6px;min-width:0}
+.dc-field-head{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;row-gap:2px;min-width:0}
+.dc-field-label{font-size:13.5px;font-weight:600;color:var(--dc-text)}
+.dc-field-key{font-size:11px;line-height:1.6;letter-spacing:.012em;color:var(--dc-text-3);background:var(--dc-alt);border:1px solid var(--dc-line-soft);border-radius:3px;padding:0 5px;white-space:nowrap}
+.dc-field-foot{min-height:19px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:12.5px;line-height:1.5}
+.dc-code{color:var(--dc-accent-deep);font-variant-numeric:tabular-nums;font-weight:600;white-space:nowrap}
+.dc-code-warn{color:var(--dc-warn);font-weight:500;white-space:nowrap}
+.dc-code-bad{color:var(--dc-bad);font-weight:500;white-space:nowrap}
+.dc-legend{color:var(--dc-text-3);font-size:12.5px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dc-entry-foot{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin:20px -22px 0;padding:13px 22px;border-top:1px solid var(--dc-line);background:var(--dc-alt);border-radius:0 0 6px 6px}
+.dc-preview{display:flex;gap:9px;align-items:baseline;flex-wrap:wrap;min-width:0;font-size:12.5px}
+.dc-preview-label{color:var(--dc-text-2);white-space:nowrap;font-weight:600}
+.dc-preview .dc-preview-body{font-size:12.5px;line-height:1.7;letter-spacing:.012em;color:var(--dc-text-2);background:var(--dc-raised);border:1px solid var(--dc-line);border-radius:4px;padding:1px 8px;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-variant-numeric:tabular-nums}
+.dc-entry-actions{display:flex;gap:10px;align-items:center;justify-content:flex-end;flex-wrap:wrap}
+
+/* ------------------------------------------------------- recent entries */
+.dc-recent{margin-top:24px}
+.dc-recent-head{display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:13px;color:var(--dc-text-2);margin-bottom:8px}
 .dc-recent ul{list-style:none;margin:0;padding:0}
-.dc-recent li{display:grid;grid-template-columns:44px minmax(0,1fr) auto;gap:10px;align-items:center;padding:6px 10px;border:1px solid var(--dc-line);border-radius:8px;margin-bottom:5px;background:var(--dc-panel);font-size:11.5px}
-.dc-recent-id{font-variant-numeric:tabular-nums;color:var(--dc-text-2)}
-.dc-recent-body{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.dc-recent-code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:10.5px;color:var(--dc-text-2)}
+.dc-recent li{display:grid;grid-template-columns:58px minmax(0,1fr) auto;gap:14px;align-items:center;padding:8px 12px;border:1px solid var(--dc-line-soft);border-radius:5px;margin-bottom:6px;background:var(--dc-panel);font-size:13.5px}
+.dc-recent-id{font-variant-numeric:tabular-nums;color:var(--dc-text-2);font-weight:600}
+.dc-recent-body{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dc-text)}
+.dc-recent-code{font-size:12.5px;line-height:1.7;letter-spacing:.012em;color:var(--dc-text-3);font-variant-numeric:tabular-nums;white-space:nowrap}
+
+/* ------------------------------------------------------------ data table */
 .dc-data{flex:1;min-height:0;display:flex;flex-direction:column}
-.dc-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:10px 20px;border-bottom:1px solid var(--dc-line);flex:none}
-.dc-search{width:220px;height:30px;font-size:12px}
-.dc-toolbar-count{font-size:11px;color:var(--dc-text-2);font-variant-numeric:tabular-nums}
+.dc-toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:12px 20px;border-bottom:1px solid var(--dc-line);background:var(--dc-panel);flex:none}
+.dc-input.dc-search{width:240px;height:34px;font-size:13.5px}
+.dc-toolbar-count{font-size:12.5px;color:var(--dc-text-2);font-variant-numeric:tabular-nums;padding:0 2px}
 .dc-spacer{flex:1}
-.dc-confirm{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;color:var(--dc-warn)}
+.dc-confirm{display:inline-flex;align-items:center;gap:8px;font-size:12.5px;color:var(--dc-warn);background:var(--dc-warn-soft);border:1px solid #e6d9b8;border-radius:5px;padding:2px 8px}
 .dc-table-wrap{flex:1;min-height:0;overflow:auto;padding:0 20px 28px}
-.dc-table{width:100%;border-collapse:separate;border-spacing:0;font-size:12.5px}
-.dc-table th{position:sticky;top:0;z-index:2;background:var(--dc-bg);text-align:left;padding:9px 8px 7px;border-bottom:1px solid var(--dc-line-2);font-weight:600;white-space:nowrap}
-.dc-th-label{display:block;max-width:180px;overflow:hidden;text-overflow:ellipsis}
-.dc-th-key{display:block;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:9.5px;font-weight:400;color:var(--dc-text-2);opacity:.8}
-.dc-th-id{width:96px}
-.dc-table td{border-bottom:1px solid var(--dc-line);padding:2px 4px;min-width:92px;position:relative}
-.dc-table tbody tr:hover td{background:color-mix(in oklab,var(--dc-raised) 55%,transparent)}
-.dc-td-id{width:96px}
-.dc-cell-input{width:100%;height:30px;padding:0 6px;border:1px solid transparent;border-radius:6px;background:transparent;font-size:12.5px;outline:none}
+.dc-table{width:100%;border-collapse:separate;border-spacing:0;font-size:13.5px;font-variant-numeric:tabular-nums}
+.dc-table th{position:sticky;top:0;z-index:2;background:var(--dc-alt);text-align:left;padding:11px 10px 9px;border-bottom:1px solid var(--dc-line-strong);font-weight:600;white-space:nowrap;color:var(--dc-text)}
+.dc-th-label{display:block;max-width:180px;overflow:hidden;text-overflow:ellipsis;font-size:13.5px;font-weight:600}
+.dc-th-key{display:inline-block;margin-top:2px;font-size:10.5px;line-height:1.6;letter-spacing:.012em;font-weight:400;color:var(--dc-text-3);background:var(--dc-raised);border:1px solid var(--dc-line-soft);border-radius:3px;padding:0 5px}
+.dc-th-id{width:104px}
+.dc-table td{border-bottom:1px solid var(--dc-line-soft);padding:3px 6px;min-width:104px;position:relative;vertical-align:middle}
+.dc-table tbody tr:hover td{background:var(--dc-alt)}
+.dc-td-id{width:104px}
+.dc-cell-input{width:100%;height:32px;padding:0 8px;border:1px solid transparent;border-radius:4px;background:transparent;color:var(--dc-text);font-size:13.5px;outline:none}
 .dc-cell-input:hover{border-color:var(--dc-line)}
-.dc-cell-input:focus{border-color:var(--dc-brand);background:var(--dc-bg);box-shadow:0 0 0 2px color-mix(in oklab,var(--dc-brand) 15%,transparent)}
-.dc-cell-id{text-align:center;font-variant-numeric:tabular-nums;color:var(--dc-text-2)}
-.dc-row-del{position:absolute;right:2px;top:50%;transform:translateY(-50%);width:18px;height:18px;border:0;border-radius:50%;background:transparent;color:var(--dc-text-2);cursor:pointer;opacity:0;font-size:13px;line-height:1}
-.dc-table tbody tr:hover .dc-row-del{opacity:1}
-.dc-row-del:hover{background:color-mix(in oklab,var(--dc-bad) 14%,transparent);color:var(--dc-bad)}
-.dc-cell-code{display:block;padding:5px 6px;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px}
-.dc-table-empty,.dc-table-more{padding:14px;text-align:center;font-size:11.5px;color:var(--dc-text-2)}
-.dc-coding{flex:1;min-height:0;overflow:auto;padding:24px 28px 56px}
-.dc-section-head{display:flex;align-items:flex-end;justify-content:space-between;gap:14px;flex-wrap:wrap}
-.dc-section-head h2{font-size:15.5px;margin:0;font-weight:650}
-.dc-section-head p{margin:4px 0 0;font-size:11.5px;color:var(--dc-text-2);max-width:72ch}
-.dc-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:12px;margin-top:16px}
-.dc-card{border:1px solid var(--dc-line);border-radius:12px;background:var(--dc-panel);padding:13px 14px;display:flex;flex-direction:column;gap:10px;min-width:0}
-.dc-card-head{display:flex;align-items:center;gap:7px;flex-wrap:wrap}
-.dc-card-title{display:flex;align-items:baseline;gap:6px;min-width:0}
-.dc-card-title strong{font-size:13px;font-weight:650}
-.dc-card-title code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:10px;color:var(--dc-text-2);opacity:.8}
-.dc-card-count{margin-left:auto;font-size:10.5px;color:var(--dc-text-2);font-variant-numeric:tabular-nums}
-.dc-card-tools{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding-top:9px;border-top:1px dashed var(--dc-line)}
-.dc-select{height:28px;padding:0 6px;border:1px solid var(--dc-line);border-radius:7px;background:var(--dc-bg);font-size:11.5px;outline:none;cursor:pointer}
-.dc-select:hover{border-color:var(--dc-line-2)}
-.dc-switch{display:inline-flex;align-items:center;gap:4px;font-size:11px;color:var(--dc-text-2);cursor:pointer;user-select:none}
-.dc-switch input{width:13px;height:13px;accent-color:var(--dc-brand);margin:0}
-.dc-map-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(132px,1fr));gap:6px}
-.dc-map{display:flex;align-items:center;gap:4px;border:1px solid var(--dc-line);border-radius:7px;padding:2px 6px;background:var(--dc-bg);min-width:0}
-.dc-map-value{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11.5px}
-.dc-map-eq{color:var(--dc-text-2);font-size:11px}
-.dc-map-input{width:42px;height:24px;text-align:center;border:1px solid var(--dc-line);border-radius:5px;background:var(--dc-bg);font-size:11.5px;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;outline:none}
-.dc-map-input:focus{border-color:var(--dc-brand)}
-.dc-map-warn{color:var(--dc-warn);font-weight:700;font-size:11px}
-.dc-map-more{grid-column:1/-1;font-size:10.5px;color:var(--dc-text-2)}
-.dc-card-note{margin:0;font-size:11px;color:var(--dc-text-2)}
-.dc-card-foot{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding-top:8px;border-top:1px dashed var(--dc-line);font-size:10.5px;color:var(--dc-text-2)}
-.dc-card-foot code{color:var(--dc-text);font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:10.5px}
+.dc-cell-input:focus{border-color:var(--dc-accent-deep);background:var(--dc-raised)}
+.dc-cell-input[aria-invalid="true"]{border-color:#d8a99b;background:var(--dc-bad-soft);color:var(--dc-bad)}
+.dc-cell-id{text-align:center;font-variant-numeric:tabular-nums;color:var(--dc-text-2);font-weight:600}
+.dc-row-del{position:absolute;right:2px;top:50%;transform:translateY(-50%);width:20px;height:20px;border:1px solid transparent;border-radius:4px;background:transparent;color:var(--dc-text-3);cursor:pointer;opacity:0;font-size:14px;line-height:1;padding:0}
+.dc-table tbody tr:hover .dc-row-del,.dc-row-del:focus-visible{opacity:1}
+.dc-row-del:hover{background:var(--dc-bad-soft);border-color:#dcb3aa;color:var(--dc-bad)}
+.dc-cell-code{display:block;padding:6px 8px;font-size:13px;line-height:1.7;letter-spacing:.012em;font-variant-numeric:tabular-nums;color:var(--dc-text-2)}
+.dc-table-empty,.dc-table-more{padding:18px;text-align:center;font-size:13px;color:var(--dc-text-3)}
+.dc-table-empty{background:var(--dc-panel);border:1px solid var(--dc-line-soft);border-top:0;border-radius:0 0 5px 5px}
+
+/* ---------------------------------------------------------------- coding */
+.dc-section-head{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;flex-wrap:wrap}
+.dc-section-head h2{font-size:17px;line-height:1.3;margin:0;font-weight:600;color:var(--dc-text)}
+.dc-section-head p{margin:6px 0 0;font-size:13px;line-height:1.6;color:var(--dc-text-2);max-width:72ch}
+.dc-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(332px,1fr));gap:14px;margin-top:18px}
+.dc-card{border:1px solid var(--dc-line);border-radius:7px;background:var(--dc-panel);padding:15px 16px 14px;display:flex;flex-direction:column;gap:12px;min-width:0}
+.dc-card-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.dc-card-title{display:flex;align-items:baseline;gap:7px;min-width:0;flex-wrap:wrap}
+.dc-card-title strong{font-size:15px;font-weight:600;color:var(--dc-text)}
+.dc-card-title code{font-size:10.5px;line-height:1.6;letter-spacing:.012em;color:var(--dc-text-3);background:var(--dc-alt);border:1px solid var(--dc-line-soft);border-radius:3px;padding:0 5px}
+.dc-card-count{margin-left:auto;font-size:12px;color:var(--dc-text-3);font-variant-numeric:tabular-nums;white-space:nowrap}
+.dc-card-tools{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding-top:11px;border-top:1px solid var(--dc-line-soft)}
+.dc-select{height:30px;padding:0 8px;border:1px solid var(--dc-line-strong);border-radius:5px;background:var(--dc-raised);color:var(--dc-text);font-size:13px;outline:none;cursor:pointer}
+.dc-select:hover{border-color:var(--dc-text-3)}
+.dc-select:focus{border-color:var(--dc-accent-deep);outline:2px solid var(--dc-accent-deep);outline-offset:2px}
+.dc-switch{display:inline-flex;align-items:center;gap:6px;font-size:13px;color:var(--dc-text-2);cursor:pointer;user-select:none}
+.dc-switch input{width:15px;height:15px;accent-color:var(--dc-accent-deep);margin:0}
+.dc-inline{display:inline-flex;align-items:center;gap:7px;font-size:13px;color:var(--dc-text-2)}
+.dc-map-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:7px}
+.dc-map{display:flex;align-items:center;gap:7px;border:1px solid var(--dc-line-soft);border-radius:5px;padding:3px 8px;background:var(--dc-raised);min-width:0}
+.dc-map-value{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;color:var(--dc-text)}
+.dc-map-eq{color:var(--dc-text-3);font-size:12px}
+.dc-map-input{width:46px;height:26px;text-align:center;border:1px solid var(--dc-line-strong);border-radius:4px;background:var(--dc-panel);font-size:13px;color:var(--dc-text);font-variant-numeric:tabular-nums;outline:none}
+.dc-map-input:focus{border-color:var(--dc-accent-deep)}
+.dc-map-warn{color:var(--dc-warn);font-weight:600;font-size:12.5px}
+.dc-map-more{grid-column:1/-1;font-size:12px;color:var(--dc-text-3)}
+.dc-map-del{flex:none;width:20px;height:20px;padding:0;border:1px solid transparent;border-radius:3px;background:transparent;color:var(--dc-text-3);font-size:15px;line-height:1;cursor:pointer}
+.dc-map-del:hover{background:var(--dc-bad-soft);border-color:#e0c1b7;color:var(--dc-bad)}
+.dc-dimadd{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:8px;padding-top:8px;border-top:1px solid var(--dc-line-soft)}
+.dc-dimadd .dc-input{height:30px;font-size:13px;padding:0 8px}
+.dc-dimadd-value{flex:1 1 130px;min-width:0}
+.dc-dimadd-code{width:70px;flex:none;text-align:center}
+.dc-ignored{margin-top:8px;border-top:1px solid var(--dc-line-soft);padding-top:7px}
+.dc-ignored summary{cursor:pointer;font-size:12.5px;color:var(--dc-text-3);outline:none}
+.dc-ignored summary:hover{color:var(--dc-text)}
+.dc-ignored-row{display:flex;align-items:center;gap:8px;justify-content:space-between;padding:3px 0;font-size:12.5px;color:var(--dc-text-2)}
+.dc-ignored-row span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dc-card-note{margin:0;font-size:13px;line-height:1.6;color:var(--dc-text-3)}
+.dc-card-foot{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding-top:10px;border-top:1px solid var(--dc-line-soft);font-size:12px;color:var(--dc-text-3)}
+.dc-card-foot code{color:var(--dc-text-2);font-size:12.5px;line-height:1.7;letter-spacing:.012em;font-variant-numeric:tabular-nums}
 .dc-missing{color:var(--dc-warn)}
-.dc-addvar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:16px;padding:12px;border:1px dashed var(--dc-line-2);border-radius:10px}
-.dc-addvar .dc-input{max-width:300px;height:30px}
-.dc-import{flex:1;min-height:0;overflow:auto;padding:24px 28px 56px;max-width:920px;margin:0 auto;width:100%}
-.dc-drop{display:flex;flex-direction:column;align-items:center;gap:3px;padding:24px;margin-top:16px;border:2px dashed var(--dc-line-2);border-radius:14px;background:var(--dc-panel);cursor:pointer;text-align:center;transition:border-color .15s ease,background .15s ease}
-.dc-drop:hover,.dc-drop.is-drag{border-color:var(--dc-brand);background:color-mix(in oklab,var(--dc-brand) 6%,transparent)}
-.dc-drop-mark{font-size:22px;color:var(--dc-brand);line-height:1}
-.dc-drop strong{font-size:13px;font-weight:650}
-.dc-drop span{font-size:11.5px;color:var(--dc-text-2)}
-.dc-drop small{font-size:10.5px;color:var(--dc-text-2);opacity:.85}
-.dc-preview-panel{margin-top:14px;border:1px solid var(--dc-line);border-radius:12px;background:var(--dc-panel);padding:13px 14px}
-.dc-preview-head{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
-.dc-preview-head strong{font-size:12.5px;max-width:52ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.dc-inline{display:inline-flex;align-items:center;gap:6px;font-size:11px;color:var(--dc-text-2)}
-.dc-input-num{width:62px;height:28px;text-align:center}
-.dc-preview-stats{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0 8px}
-.dc-preview-table{max-height:230px;overflow:auto;border:1px solid var(--dc-line);border-radius:8px;background:var(--dc-bg)}
-.dc-table-mini{font-size:11.5px}
-.dc-table-mini th{padding:6px 8px}
-.dc-table-mini td{padding:5px 8px;min-width:0;white-space:nowrap;max-width:220px;overflow:hidden;text-overflow:ellipsis}
-.dc-preview-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:12px}
-.dc-templates{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px;margin-top:18px}
-.dc-template{display:flex;flex-direction:column;gap:4px;text-align:left;padding:12px;border:1px solid var(--dc-line);border-radius:10px;background:var(--dc-panel);cursor:pointer;transition:border-color .15s ease,transform .15s ease}
-.dc-template:hover{border-color:var(--dc-line-2);transform:translateY(-1px)}
-.dc-template strong{font-size:12.5px;font-weight:650}
-.dc-template span{font-size:10.5px;color:var(--dc-text-2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.dc-folder{margin-top:24px;padding-top:16px;border-top:1px solid var(--dc-line)}
-.dc-folder-row{display:flex;align-items:center;gap:8px;margin-top:10px}
-.dc-hint{margin:8px 0 0;font-size:11px;color:var(--dc-text-2)}
-.dc-chip{display:inline-flex;align-items:center;height:20px;padding:0 7px;border-radius:999px;border:1px solid var(--dc-line);background:var(--dc-raised);font-size:10.5px;color:var(--dc-text-2);white-space:nowrap;font-variant-numeric:tabular-nums}
-.dc-chip-brand{color:var(--dc-brand);border-color:color-mix(in oklab,var(--dc-brand) 36%,var(--dc-line));background:color-mix(in oklab,var(--dc-brand) 8%,transparent)}
-.dc-chip-ok{color:var(--dc-ok);border-color:color-mix(in oklab,var(--dc-ok) 36%,var(--dc-line));background:color-mix(in oklab,var(--dc-ok) 8%,transparent)}
-.dc-chip-bad{color:var(--dc-bad);border-color:color-mix(in oklab,var(--dc-bad) 36%,var(--dc-line));background:color-mix(in oklab,var(--dc-bad) 8%,transparent)}
-.dc-chip-muted{opacity:.8}
-.dc-empty{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;padding:48px 24px;color:var(--dc-text-2);text-align:center}
-.dc-empty-mark{width:38px;height:38px;border-radius:50%;border:1px dashed var(--dc-line-2);display:flex;align-items:center;justify-content:center;font-size:17px;color:var(--dc-text-2)}
-.dc-empty strong{font-size:14px;color:var(--dc-text);font-weight:650}
-.dc-empty p{margin:0;font-size:12px;max-width:44ch}
-.dc-empty-actions{display:flex;gap:8px;margin-top:6px}
-@media (max-width:720px){
-.dc-top{height:auto;min-height:56px;flex-wrap:wrap;padding:8px 12px;row-gap:6px}
-.dc-brand-text .dc-name{display:none}
-.dc-tabs{order:3;width:100%;justify-content:space-between}
-.dc-top-right{margin-left:auto}
-.dc-top-right .dc-total{display:none}
-.dc-entry,.dc-coding,.dc-import{padding:16px 14px 40px}
-.dc-entry-head{flex-wrap:wrap;align-items:flex-start}
+.dc-addvar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:18px;padding:14px;border:1px dashed var(--dc-line-strong);border-radius:7px;background:var(--dc-sunk)}
+.dc-addvar .dc-input{max-width:320px;height:34px}
+
+/* ---------------------------------------------------------------- import */
+.dc-import{max-width:960px;margin:0 auto;width:100%}
+.dc-folder{margin-top:26px;padding-top:18px;border-top:1px solid var(--dc-line)}
+.dc-folder h2{font-size:17px;line-height:1.3;margin:0;font-weight:600;color:var(--dc-text)}
+.dc-folder p{margin:6px 0 0;font-size:13px;line-height:1.6;color:var(--dc-text-2)}
+.dc-folder label{display:block;margin-top:12px;font-size:13px;color:var(--dc-text-2)}
+.dc-folder label>input{display:block;width:100%;margin-top:6px}
+.dc-folder-row{display:flex;align-items:center;gap:10px;margin-top:12px;flex-wrap:wrap}
+.dc-folder-row .dc-input{flex:1 1 180px;min-width:0;height:36px}
+.dc-hint{margin:10px 0 0;font-size:12.5px;line-height:1.75;color:var(--dc-text-3)}
+.dc-drop{display:flex;flex-direction:column;align-items:center;gap:5px;padding:26px 24px;margin-top:18px;border:1px dashed var(--dc-accent-line);border-radius:7px;background:var(--dc-accent-soft);cursor:pointer;text-align:center;transition:background .15s ease,border-color .15s ease}
+.dc-drop:hover,.dc-drop.is-drag{background:var(--dc-accent-soft-2);border-color:var(--dc-accent)}
+.dc-drop-mark{font-size:22px;color:var(--dc-accent-deep);line-height:1.1}
+.dc-drop strong{font-size:15px;font-weight:600;color:var(--dc-text)}
+.dc-drop span{font-size:13px;color:var(--dc-text-2)}
+.dc-drop small{font-size:12px;color:var(--dc-text-3)}
+.dc-preview-panel{margin-top:16px;border:1px solid var(--dc-line);border-radius:7px;background:var(--dc-panel);padding:15px 16px}
+.dc-preview-panel .dc-preview-body{display:block;min-width:0;background:transparent;border:0;padding:0;max-width:none;white-space:normal}
+.dc-preview-head{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+.dc-preview-head strong{font-size:15px;font-weight:600;max-width:52ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dc-text)}
+.dc-preview-stats{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0 10px}
+.dc-preview-table{max-height:240px;overflow:auto;border:1px solid var(--dc-line);border-radius:5px;background:var(--dc-raised)}
+.dc-preview-actions{display:flex;justify-content:flex-end;gap:10px;flex-wrap:wrap;margin-top:14px}
+.dc-table-mini{font-size:13px}
+.dc-table-mini th{padding:9px 10px}
+.dc-table-mini td{padding:7px 10px;min-width:0;white-space:nowrap;max-width:220px;overflow:hidden;text-overflow:ellipsis;color:var(--dc-text-2)}
+.dc-templates{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px;margin-top:20px}
+.dc-template{display:flex;flex-direction:column;gap:6px;text-align:left;padding:14px 15px;border:1px solid var(--dc-line);border-radius:5px;background:var(--dc-raised);cursor:pointer;transition:border-color .15s ease,background .15s ease}
+.dc-template:hover{border-color:var(--dc-accent);background:var(--dc-accent-soft)}
+.dc-template strong{font-size:14px;font-weight:600;color:var(--dc-text)}
+.dc-template span{font-size:12.5px;color:var(--dc-text-3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* ----------------------------------------------------------------- chips */
+.dc-chip{display:inline-flex;align-items:center;gap:5px;height:22px;padding:0 8px;border-radius:4px;border:1px solid var(--dc-line);background:var(--dc-alt);font-size:12.5px;color:var(--dc-text-2);white-space:nowrap;font-variant-numeric:tabular-nums}
+.dc-chip-brand{color:var(--dc-accent-deep);border-color:var(--dc-accent-soft-2);background:var(--dc-accent-soft)}
+.dc-chip-ok{color:var(--dc-ok);border-color:#cadac6;background:var(--dc-ok-soft)}
+.dc-chip-bad{color:var(--dc-bad);border-color:#e1bdb4;background:var(--dc-bad-soft)}
+.dc-chip-muted{color:var(--dc-text-3);background:transparent}
+
+/* --------------------------------------------------------- empty states */
+.dc-empty{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;padding:56px 24px;color:var(--dc-text-2);text-align:center;background:var(--dc-bg)}
+.dc-empty-mark{width:46px;height:46px;border-radius:7px;border:1px dashed var(--dc-accent-line);background:var(--dc-accent-soft);display:flex;align-items:center;justify-content:center;font-size:18px;line-height:1;color:var(--dc-accent-deep)}
+.dc-empty strong{font-size:17px;line-height:1.3;color:var(--dc-text);font-weight:600}
+.dc-empty p{margin:0;max-width:46ch;font-size:13.5px;line-height:1.7}
+.dc-empty-actions{display:flex;gap:10px;flex-wrap:wrap;justify-content:center;margin-top:8px}
+
+/* ------------------------------------------------------------ responsive */
+@media (max-width:1100px){
+.dc-cards{grid-template-columns:repeat(auto-fill,minmax(300px,1fr))}
+}
+@media (max-width:820px){
+.dc-top{flex-wrap:wrap;align-items:center;gap:12px;padding:10px 16px;min-height:56px}
+.dc-brand{flex:1 1 auto}
+.dc-name{width:148px}
+.dc-tabs{order:3;flex:1 1 100%;gap:18px;border-top:1px solid var(--dc-line-soft);padding-top:2px;margin-top:2px}
+.dc-tab{height:36px}
+.dc-top-right{margin-left:auto;flex-wrap:wrap;justify-content:flex-end}
+.dc-entry,.dc-coding,.dc-import{padding:20px 16px 40px}
+.dc-entry-head{flex-wrap:wrap;align-items:flex-start;gap:12px;padding:16px 18px 13px}
+.dc-form{padding:18px 18px 0}
+.dc-entry-foot{margin:18px -18px 0;padding:12px 18px}
 .dc-fields{grid-template-columns:1fr}
 .dc-cards{grid-template-columns:1fr}
-.dc-entry-foot{flex-direction:column;align-items:stretch;gap:10px}
-.dc-entry-actions{justify-content:flex-end}
-.dc-toolbar .dc-search{width:100%}
+.dc-table-wrap{padding:0 16px 24px}
+.dc-table{min-width:560px}
+.dc-toolbar{padding:10px 16px}
+}
+@media (max-width:560px){
+.dc-top{padding:10px 14px;row-gap:8px}
+.dc-brand-text strong{font-size:15px}
+.dc-name{width:132px}
+.dc-tabs{gap:14px;justify-content:space-between}
+.dc-tab{height:38px;font-size:14.5px}
+.dc-total{display:none}
+.dc-alert,.dc-saved{padding:8px 14px;font-size:12.5px}
+.dc-entry,.dc-coding,.dc-import{padding:16px 12px 32px}
+.dc-entry-head{flex-direction:column;align-items:stretch;gap:10px;padding:15px 14px 12px}
+.dc-entry-head h2{font-size:21px}
+.dc-idbox{justify-content:space-between;width:100%}
+.dc-input.dc-input-id{width:96px;height:36px}
+.dc-form{padding:16px 14px 0}
+.dc-entry-foot{margin:16px -14px 0;padding:12px 14px;flex-direction:column;align-items:stretch;gap:10px}
+.dc-entry-actions{justify-content:stretch;gap:8px}
+.dc-entry-actions .dc-btn{flex:1 1 auto;min-width:0}
+.dc-preview{width:100%}
+.dc-recent li{grid-template-columns:56px minmax(0,1fr);gap:6px 12px}
+.dc-recent-code{grid-column:1/-1;white-space:normal}
+.dc-input.dc-search{width:100%;flex:1 1 100%}
+.dc-toolbar{row-gap:8px}
+.dc-toolbar .dc-btn{height:32px}
+.dc-table-wrap{padding:0 12px 20px}
+.dc-table{min-width:520px}
+.dc-card{padding:14px}
+.dc-map-grid{grid-template-columns:repeat(auto-fill,minmax(132px,1fr))}
+.dc-addvar .dc-input{max-width:none;flex:1 1 100%}
+.dc-folder-row .dc-input{flex:1 1 100%}
+.dc-drop{padding:20px 16px}
+.dc-preview-actions .dc-btn{flex:1 1 140px}
+.dc-saved{flex-wrap:wrap}
+.dc-saved-path{flex:1 1 100%}
+.dc-row-del{opacity:.7}
+}
+@media (max-width:430px){
+.dc-root{font-size:15px}
+.dc-btn{height:40px;font-size:15px;padding:0 12px}
+.dc-btn-sm{height:38px;font-size:14px;padding:0 9px}
+.dc-input{height:42px;font-size:16px}
+.dc-input.dc-input-id{height:42px;font-size:16px;width:104px}
+.dc-input.dc-search,.dc-input.dc-input-num{height:42px;font-size:16px}
+.dc-dimadd .dc-input{height:40px;font-size:15px}
+.dc-dimadd .dc-dimadd-code{width:76px}
+.dc-map-del{width:28px;height:28px;font-size:18px}
+.dc-select{height:38px;font-size:14px}
+.dc-cell-input{height:36px;font-size:14px}
+.dc-tab{font-size:15px;gap:4px}
+.dc-tabs{gap:12px}
+.dc-drop strong{font-size:16px}
+.dc-drop span,.dc-drop small{font-size:13px}
+.dc-preview-actions .dc-btn{flex:1 1 100%}
+.dc-empty{padding:40px 16px}
 }
 `
 
@@ -2736,6 +3174,12 @@ window.__ModuleLoader__.load({
         datasetCsv,
         codebookCsv,
         datasetJson,
+        parseSnapshot,
+        nextParticipantId,
+        valueProblem,
+        suggestDictValue,
+        draftKey,
+        loadDataset,
         codeOf,
         canonicalValue,
         matchDictByLabel,
