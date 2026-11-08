@@ -2,7 +2,7 @@
 
 给 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)(`dsh`)写的研究插件:人口学变量录入台。把 Excel/Word 问卷、纸质表格和零散 CSV 里的基本信息,变成一份有列定义、有编码规则、可导出可回溯的数据表。
 
-版本 1.2.0 · 需要 DSH ≥ 0.2.2-rc.1 · MIT 许可 · 依赖 [`@local/research-core`](https://github.com/yyh33028-netizen/dsh-research-core)
+版本 1.2.0 · 需要 DSH ≥ 0.2.2-rc.1 · MIT 许可 · 依赖 [`@local/research-core`](https://github.com/yyh2030/dsh-research-core)
 
 ## 为什么需要它
 
@@ -25,15 +25,15 @@
 ## 安装
 
 ```powershell
-git clone https://github.com/yyh33028-netizen/dsh-research-core.git
-git clone https://github.com/yyh33028-netizen/dsh-demographic-coder.git
+git clone https://github.com/yyh2030/dsh-research-core.git
+git clone https://github.com/yyh2030/dsh-demographic-coder.git
 dsh plugin --profile <profile> add link:<父目录>\dsh-demographic-coder
 ```
 
 或者用 git 形式:
 
 ```powershell
-dsh plugin --profile <profile> add git+https://github.com/yyh33028-netizen/dsh-demographic-coder.git
+dsh plugin --profile <profile> add git+https://github.com/yyh2030/dsh-demographic-coder.git
 ```
 
 两种方式都要求 `research-core` 与本插件同级,插件用相对路径 `../research-core/host.mjs` 引用共享核心。仓库是私有的,安装前需要有访问权限。装完重启承载 `dsh web` 的进程,面板改动需要刷新页面。
