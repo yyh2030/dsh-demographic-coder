@@ -1,5 +1,7 @@
 # @local/demographic-coder
 
+[English](README.en.md) · 中文
+
 给 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)(`dsh`)写的研究插件:人口学变量录入台。把 Excel/Word 问卷、纸质表格和零散 CSV 里的基本信息,变成一份有列定义、有编码规则、可导出可回溯的数据表。
 
 版本 1.2.0 · 需要 DSH ≥ 0.2.2-rc.1 · MIT 许可 · 依赖 [`@local/research-core`](https://github.com/yyh2030/dsh-research-core)
