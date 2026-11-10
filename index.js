@@ -344,7 +344,7 @@ export function apply(ctx, config = {}) {
           send(res, 404, { ok: false, error: { code: 'unknown_action', message: '未知操作：' + name } })
           return
         }
-        const actor = binding.pageActor({ req, pageId: url.searchParams.get('pageId') })
+        const actor = binding.pageActor({ req, pageId: url.searchParams.get('pageId'), workspaceId: url.searchParams.get('workspaceId'), sessionId: url.searchParams.get('sessionId') })
         send(res, 200, { ok: true, data: await action(actor, name, Object.fromEntries(url.searchParams)) })
         return
       }
@@ -359,7 +359,7 @@ export function apply(ctx, config = {}) {
         return
       }
       const payload = body.payload || body
-      const actor = binding.pageActor({ req, pageId: payload.pageId })
+      const actor = binding.pageActor({ req, pageId: payload.pageId, workspaceId: payload.workspaceId, sessionId: payload.sessionId })
       send(res, 200, { ok: true, data: await action(actor, name, payload) })
     } catch (error) {
       const status = bindingStatus(error) || statusFor(error)
