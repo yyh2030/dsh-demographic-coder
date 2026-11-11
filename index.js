@@ -17,9 +17,9 @@ import { createHash, randomUUID } from 'node:crypto'
 import path from 'node:path'
 import { validateDataset, legacyDataset, mirrorDocument } from './dataset.js'
 import { loadStudyContext, validateStudyDefinition } from './study-context.mjs'
-import { hostBinding, bindingStatus } from '../research-core/host.mjs'
-import { openResearchData } from '../research-core/data.mjs'
-import { openFlow } from '../research-core/flow.mjs'
+import { hostBinding, bindingStatus } from '@local/research-core/host'
+import { openResearchData } from '@local/research-core/data'
+import { openFlow } from '@local/research-core/flow'
 
 // Serialize requests from all instances in this process; the lock file also
 // protects independently running hosts sharing the same research directory.
