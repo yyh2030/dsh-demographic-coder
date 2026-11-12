@@ -1680,7 +1680,7 @@ window.__ModuleLoader__.load({
       const response = await fetch(API, {
         method: 'POST',
         headers: { 'content-type': 'application/json', 'x-demographic-coder': '1', ...ticket.headers },
-        body: JSON.stringify({ action, payload: { ...(payload || {}), ...ticket.body, binding: ticket.token } })
+        body: JSON.stringify({ action, payload: { ...(payload || {}), ...ticket.body } })
       })
       const body = await response.json().catch(() => null)
       if (!response.ok || !body || !body.ok) {
