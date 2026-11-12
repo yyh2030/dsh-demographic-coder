@@ -135,7 +135,16 @@ export function apply(ctx, config = {}) {
     hooks: {
       emptyBase: () => fallbackBase(),
       loadStudy: studyPath => loadStudyContext({ studyPath }, { cwd: fallbackBase(), pluginKey: 'demographics' }),
-      currentIdentity: () => ({ studyId: activeStudy.id, studyPath: activeStudy.path, dataRoot: activeStudy.dataRoot, revision: activeStudy.revision }),
+      currentIdentity: () => {
+        // 无页面/显式路径时回退到旧配置研究，四个插件对同一启动看到同一研究。
+        if (!activeStudy.path) {
+          try {
+            const legacy = binding.legacyStudy()
+            if (legacy && legacy.studyPath) activeStudy = loadStudyContext({ studyPath: legacy.studyPath }, { cwd: fallbackBase(), pluginKey: 'demographics' })
+          } catch { /* 无旧配置时保持空研究 */ }
+        }
+        return { studyId: activeStudy.id, studyPath: activeStudy.path, dataRoot: activeStudy.dataRoot, revision: activeStudy.revision }
+      },
       busy: () => savingCount > 0,
       prepareSwitch(studyPath) {
         if (savingCount) throw new RouteError('busy', '人口学数据正在保存，无法切换研究')
