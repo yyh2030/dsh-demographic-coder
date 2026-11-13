@@ -126,7 +126,7 @@ export function apply(ctx, config = {}) {
   }
 
   let activeStudy = loadStudyContext(config, { cwd: fallbackBase(), pluginKey: 'demographics' })
-  const VERSION = '1.2.0'
+  const VERSION = '1.2.1'
   let savingCount = 0
   const binding = hostBinding(ctx, {
     plugin: 'demographic-coder',
@@ -294,17 +294,10 @@ export function apply(ctx, config = {}) {
     if (typeof target !== 'string' || !path.isAbsolute(target)) throw new RouteError('invalid', '新研究配置需要绝对 JSON 路径')
     const problems = validateStudyDefinition(payload.definition)
     if (problems.length) throw new RouteError('invalid', problems.join('；'))
-    await mkdir(path.dirname(target), { recursive: true })
-    try { await writeFile(target, JSON.stringify(payload.definition, null, 2), { encoding: 'utf8', flag: 'wx' }) }
-    catch (error) { if (error.code === 'EEXIST') throw new RouteError('conflict', '配置已存在，请选择加载或使用新路径'); throw error }
-    try {
-      const view = binding.connect(actor, { studyPath: target })
-      const active = await binding.activate(actor)
-      return { binding: active || view, study: activeStudy.identity }
-    } catch (error) {
-      await unlink(target).catch(() => {})
-      throw error
-    }
+    // 统一走核心创建：已有文件冲突、失败不留半套目录、成功返回实例与绑定版本。
+    const view = binding.connect(actor, { studyPath: target, create: true, definition: payload.definition })
+    const active = await binding.activate(actor)
+    return { binding: active || view, study: activeStudy.identity, instanceId: view.instanceId, bindingRevision: view.bindingRevision }
   }
 
   async function studyConnect(actor, payload = {}) {
@@ -319,6 +312,13 @@ export function apply(ctx, config = {}) {
     if (name === 'capabilities') {
       await binding.read(actor, () => null)
       return { ...binding.capabilities(actor), study: activeStudy.identity }
+    }
+    if (name === 'studyChoices') return binding.studyChoices(actor)
+    if (name === 'studyDiscover') return binding.discoverStudy(payload.dir)
+    if (name === 'studyRelocate') {
+      const view = binding.relocateStudy(actor, payload)
+      const active = await binding.activate(actor)
+      return { binding: active || view, study: activeStudy.identity, relocated: view.relocated }
     }
     if (name === 'studyConnect') return await studyConnect(actor, payload)
     if (name === 'createStudy') return await createStudy(actor, payload)
@@ -363,7 +363,7 @@ export function apply(ctx, config = {}) {
       }
       const body = await readBody(req)
       const name = String(body.action || url.searchParams.get('action') || '')
-      if (!['status', 'load', 'save', 'sync', 'reveal', 'studyConnect', 'createStudy', 'capabilities'].includes(name)) {
+      if (!['status', 'load', 'save', 'sync', 'reveal', 'studyConnect', 'createStudy', 'capabilities', 'studyChoices', 'studyDiscover', 'studyRelocate'].includes(name)) {
         send(res, 404, { ok: false, error: { code: 'unknown_action', message: '未知操作：' + name } })
         return
       }
