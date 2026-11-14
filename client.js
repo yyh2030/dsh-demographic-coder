@@ -3470,6 +3470,7 @@ window.__ModuleLoader__.load({
       return h(
         'div',
         { className: 'dc-root' },
+        h('button', { className: 'dc-btn dc-btn-quiet', type: 'button', style: { margin: '0 0 10px' }, onClick: openPickerFromButton }, '研究切换'),
         h(
           'header',
           { className: 'dc-top' },
@@ -3978,6 +3979,22 @@ window.__ModuleLoader__.load({
         ImportTab
       }
     }
+
+  function openPickerFromButton() {
+    try {
+      const ui = (hostCtx && hostCtx.get && hostCtx.get('uiWorkspace')) || (hostCtx && hostCtx.uiWorkspace)
+      const factory = window.__DSH_RESEARCH_PICKER__
+      if (!factory) throw new Error('共享选择器模块未加载')
+      const picker = factory.createStudyPicker({
+        plugin: 'demographic-coder', route: '/api/demographic-coder',
+        headers: () => ({ 'x-demographic-coder': '1', ...identity.headers() }),
+        pickDirectory: ui && typeof ui.pickDirectory === 'function' ? () => ui.pickDirectory() : null,
+      })
+      picker.install(); picker.open()
+    } catch (error) {
+      try { window.alert('研究选择器不可用：' + (error && error.message ? error.message : String(error))) } catch { /* 无窗口 */ }
+    }
+  }
 
     return {
       inject: ['slots'],
