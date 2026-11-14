@@ -4,7 +4,7 @@
 
 A research plugin written for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (`dsh`): the demographics entry desk. It turns the basic information in Excel/Word questionnaires, paper forms and scattered CSVs into one data table with column definitions, coding rules, and the ability to export and retrace.
 
-Version 1.2.0 · Requires DSH ≥ 0.2.2-rc.1 · MIT license · Depends on [`@local/research-core`](https://github.com/yyh2030/dsh-research-core)
+Version 1.2.1 · Requires DSH ≥ 0.2.2-rc.1 · MIT license · Depends on [`@local/research-core`](https://github.com/yyh2030/dsh-research-core)
 
 ## Why it exists
 
