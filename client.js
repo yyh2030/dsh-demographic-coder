@@ -3479,7 +3479,6 @@ window.__ModuleLoader__.load({
       return h(
         'div',
         { className: 'dc-root' },
-        h('button', { className: 'dc-btn dc-btn-quiet', type: 'button', style: { margin: '0 0 10px' }, onClick: openPickerFromButton }, '研究切换'),
         h(
           'header',
           { className: 'dc-top' },
@@ -3520,6 +3519,7 @@ window.__ModuleLoader__.load({
           h(
             'div',
             { className: 'dc-top-right' },
+            h(Btn, { variant: 'ghost', size: 'sm', onClick: openPickerFromButton }, '研究切换'),
             h('span', { className: 'dc-total' }, t('已录入', { n: dataset.rows.length })),
             h(Btn, { variant: 'ghost', size: 'sm', onClick: download }, t('下载CSV')),
             h(Btn, { variant: 'primary', size: 'sm', onClick: saveToDisk, disabled: saving }, saving ? t('正在保存') : t('保存CSV'))
@@ -3999,7 +3999,7 @@ window.__ModuleLoader__.load({
         headers: () => ({ 'x-demographic-coder': '1', ...identity.headers() }),
         pickDirectory: ui && typeof ui.pickDirectory === 'function' ? () => ui.pickDirectory() : null,
       })
-      picker.install(); picker.open()
+      picker.open()
     } catch (error) {
       try { window.alert('研究选择器不可用：' + (error && error.message ? error.message : String(error))) } catch { /* 无窗口 */ }
     }
@@ -4011,13 +4011,6 @@ window.__ModuleLoader__.load({
       apply(ctx) {
         hostCtx = ctx
         ctx.effect(() => insertStyles(), 'demographic-coder: styles')
-        try {
-          const ui = (ctx.get && ctx.get('uiWorkspace')) || ctx.uiWorkspace
-          window.__DSH_RESEARCH_PICKER__ && window.__DSH_RESEARCH_PICKER__.createStudyPicker({
-            plugin: 'demographic-coder', route: '/api/demographic-coder', headers: () => ({ 'x-demographic-coder': '1', ...identity.headers() }),
-            pickDirectory: ui && typeof ui.pickDirectory === 'function' ? () => ui.pickDirectory() : null,
-          }).install()
-        } catch (error) { console.warn('[demographic-coder] study picker not installed', error) }
         const PanelHost = mount(ctx)
         ctx.slots.inject('sidebar.panellist', () =>
           ctx.slots.register(
